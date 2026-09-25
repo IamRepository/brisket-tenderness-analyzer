@@ -50,8 +50,8 @@ st.markdown(
       <p class="attribution">
         Tenderness methodology inspired by the time-temperature rendering and hot-hold concepts
         shared by Steve Gow. This is an independent software implementation and is not affiliated
-        with, endorsed by, or maintained by Steve Gow.
-        This is developed by Imran Abdul-Majid
+        with, endorsed by, or maintained by Steve Gow. </p>
+        This tool is developed by Imran Abdul-Majid
       </p>
     </div>
     """,
