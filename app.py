@@ -42,10 +42,19 @@ for i,row in classifications.iterrows():
     filename=row.get('File','Reference'); col=row['Column']; key=f'{filename}_{col}' if 'File' in row else str(col); role=roles[key]
     active_df=df if filename in ('Primary','Reference') else extra_df; active_time=timestamp_col if filename in ('Primary','Reference') else extra_timestamp
     prepared=pit.prepare(active_df,active_time,col)
-    if role=='Meat temperature':
+  
+if role in (
+'🥩 Point',
+'🥩 Flat',
+'🍖 Other Meat'
+):
         valid,report=engine.prepare(active_df,active_time,col); detection=engine.classify_session(valid); meat_results[str(col)]=engine.analyse(valid,report,detection,max_gap=effective_gap)
-    elif role in ('Grate temperature','Controller temperature','Target temperature'):
-        pit_results[role]=pit.analyse(prepared,role)
+    
+elif role in (
+'🌡 Grate',
+'🔥 PID'
+):
+    pit_results[role]=pit.analyse(prepared,role)
 
 if not meat_results: st.error('At least one column must be classified as Meat temperature.'); st.stop()
 for name,result in meat_results.items():
