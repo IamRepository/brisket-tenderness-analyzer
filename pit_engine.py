@@ -4,7 +4,15 @@ import numpy as np
 import pandas as pd
 import brisket_engine as meat
 
-ROLES=['Meat temperature','Grate temperature','Controller temperature','Target temperature','Ignore']
+ROLES=[
+'🥩 Point',
+'🥩 Flat',
+'🍖 Other Meat',
+'🌡 Grate',
+'🔥 PID',
+'🚫 Ignore'
+]
+
 @dataclass(frozen=True)
 class PitResult:
     role:str; timeline:pd.DataFrame; average:float; minimum:float; maximum:float; stddev:float; stability_score:float; lid_events:pd.DataFrame
@@ -16,15 +24,33 @@ def classify_columns(df,timestamp_col):
         values=meat.parse_temp(df[col]); valid=values.dropna()
         if len(valid)<2: continue
         name=str(col).lower()
-        if any(x in name for x in ('target','setpoint','set point','desired')): role='Target temperature'; confidence=99
-        elif any(x in name for x in ('grate','ambient','pit probe','chamber probe')): role='Grate temperature'; confidence=93
-        elif any(x in name for x in ('controller','smoker','smoque','built-in','oven')): role='Controller temperature'; confidence=90
-        elif any(x in name for x in ('meat','internal','flat','point','food','brisket','probe')): role='Meat temperature'; confidence=88
+
+    if any(x in name for x in ('grate','ambient','pit probe','chamber probe')):
+role='🌡 Grate'; confidence=93
+ 
+elif any(x in name for x in ('controller','smoker','smoque','built-in','oven')):
+role='🔥 PID'; confidence=90
+ 
+elif any(x in name for x in ('point',)):
+role='🥩 Point'; confidence=95
+ 
+elif any(x in name for x in ('flat',)):
+role='🥩 Flat'; confidence=95
+ 
+elif any(x in name for x in ('meat','internal','food','brisket','probe')):
+role='🍖 Other Meat'; confidence=88
         else:
             smooth=valid.rolling(min(21,max(3,len(valid)//50)),center=True,min_periods=1).median(); rise=float(smooth.max()-smooth.iloc[:max(2,len(smooth)//20)].median()); fluct=float(valid.diff().abs().median())
-            if rise>=20: role='Meat temperature'; confidence=72
-            elif fluct>=.5: role='Grate temperature'; confidence=65
-            else: role='Controller temperature'; confidence=60
+
+if rise >= 20:
+role='🍖 Other Meat'; confidence=72
+ 
+elif fluct >= .5:
+role='🌡 Grate'; confidence=65
+ 
+else:
+role='🔥 PID'; confidence=60
+
         rows.append({'Column':col,'Suggested role':role,'Confidence':confidence})
     return pd.DataFrame(rows)
 
