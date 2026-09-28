@@ -4,14 +4,7 @@ import numpy as np
 import pandas as pd
 import brisket_engine as meat
 
-ROLES=[
-'🥩 Point',
-'🥩 Flat',
-'🍖 Other Meat',
-'🌡 Grate',
-'🔥 PID',
-'🚫 Ignore'
-]
+ROLES=['🥩 Point','🥩 Flat','🍖 Other Meat','🌡 Grate','🔥 PID','🚫 Ignore']
 
 @dataclass(frozen=True)
 class PitResult:
