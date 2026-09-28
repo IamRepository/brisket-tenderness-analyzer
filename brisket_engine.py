@@ -50,7 +50,7 @@ def detect_columns(df):
     if timestamp is None:
         score,timestamp=max((parse_ts(df[c].head(300)).notna().mean(),c) for c in columns)
         if score<.25: raise ValueError('Timestamp column not detected.')
-    probes=[c for c in columns if c!=timestamp and any(x in lowered[c] for x in ('probe','temperature','temp','flat','point','celsius','°c')) and not any(x in lowered[c] for x in ('pit','ambient','target','setpoint'))]
+    probes=[c for c in columns if c!=timestamp and any(x in lowered[c] for x in ('probe','meat','internal','flat','point','food','brisket')) and not any(x in lowered[c] for x in ('pit','ambient','grate','controller','target','setpoint'))]
     if not probes:
         scored=[]
         for c in columns:
@@ -62,40 +62,31 @@ def detect_columns(df):
 
 def prepare(df,timestamp_col,probe_col):
     raw=pd.DataFrame({'timestamp':parse_ts(df[timestamp_col]),'temperature_c':parse_temp(df[probe_col])})
-    mask=raw.timestamp.notna()&raw.temperature_c.between(-20,150)
-    valid=raw[mask].copy().sort_values('timestamp',kind='stable')
+    mask=raw.timestamp.notna()&raw.temperature_c.between(-20,150); valid=raw[mask].copy().sort_values('timestamp',kind='stable')
     duplicates=int(valid.duplicated('timestamp',keep='last').sum()); valid=valid.drop_duplicates('timestamp',keep='last').reset_index(drop=True)
-    report=ParseReport(len(raw),len(valid),int((~mask).sum()),duplicates,valid.timestamp.min() if len(valid) else None,valid.timestamp.max() if len(valid) else None)
-    return valid,report
-
-def _smooth(valid):
-    if len(valid)<7: return valid.temperature_c.astype(float)
-    span=max(5,min(61,len(valid)//30*2+1)); return valid.temperature_c.astype(float).rolling(span,center=True,min_periods=1).median()
+    return valid,ParseReport(len(raw),len(valid),int((~mask).sum()),duplicates,valid.timestamp.min() if len(valid) else None,valid.timestamp.max() if len(valid) else None)
 
 def classify_session(valid):
-    if len(valid)<5: raise ValueError('At least five valid readings are required for automatic classification.')
-    smooth=_smooth(valid).reset_index(drop=True); peak_i=int(smooth.idxmax()); peak=float(smooth.iloc[peak_i]); minimum=float(smooth.min()); average=float(smooth.mean())
-    edge=max(2,len(smooth)//20); start=float(smooth.iloc[:edge].median()); end=float(smooth.iloc[-edge:].median()); rise=peak-start; fall=peak-end; peak_fraction=peak_i/max(len(smooth)-1,1)
-    post=max(len(smooth)-peak_i-1,1); cooling_share=float((smooth.iloc[peak_i:].diff().fillna(0)<0).sum()/post); pull=pd.Timestamp(valid.timestamp.iloc[peak_i])
-    if rise>=25 and fall>=8 and .15<=peak_fraction<=.9:
-        confidence=int(min(99,65+min(rise,40)*.45+min(fall,25)*.7+cooling_share*8)); return Detection('Cook + Hold',confidence,pull,peak,average,minimum,'A substantial temperature rise is followed by a sustained cooling phase.')
-    if rise<15 and fall>=8 and peak_fraction<=.25:
-        duration=(valid.timestamp.iloc[-1]-valid.timestamp.iloc[0]).total_seconds()/3600; label='Calibration / Hold Test' if duration>=8 and end>=55 else 'Hold Only'; confidence=int(min(99,72+min(fall,25)*.7+cooling_share*10)); return Detection(label,confidence,None,peak,average,minimum,'No clear cooking rise was detected; the profile begins hot and cools over time.')
-    if rise>=20 and fall<8:
-        confidence=int(min(99,72+min(rise,45)*.5)); return Detection('Cook Only',confidence,None,peak,average,minimum,'The profile rises substantially and recording ends without a sustained cooling phase.')
-    return Detection('Uncertain',55,pull if fall>=8 else None,peak,average,minimum,'The profile does not clearly match Cook Only, Hold Only, or Cook + Hold.')
+    if len(valid)<5: raise ValueError('At least five valid readings are required.')
+    span=max(5,min(61,len(valid)//30*2+1)); smooth=valid.temperature_c.astype(float).rolling(span,center=True,min_periods=1).median().reset_index(drop=True)
+    peak_i=int(smooth.idxmax()); peak=float(smooth.iloc[peak_i]); edge=max(2,len(smooth)//20); start=float(smooth.iloc[:edge].median()); end=float(smooth.iloc[-edge:].median()); rise=peak-start; fall=peak-end; fraction=peak_i/max(len(smooth)-1,1); pull=pd.Timestamp(valid.timestamp.iloc[peak_i])
+    if rise>=25 and fall>=8 and .15<=fraction<=.9: return Detection('Cook + Hold',95,pull,peak,float(smooth.mean()),float(smooth.min()),'A substantial temperature rise is followed by a sustained cooling phase.')
+    if rise<15 and fall>=8 and fraction<=.25:
+        duration=(valid.timestamp.iloc[-1]-valid.timestamp.iloc[0]).total_seconds()/3600; label='Calibration / Hold Test' if duration>=8 and end>=55 else 'Hold Only'; return Detection(label,90,None,peak,float(smooth.mean()),float(smooth.min()),'No clear cooking rise was detected; the profile begins hot and cools over time.')
+    if rise>=20 and fall<8: return Detection('Cook Only',90,None,peak,float(smooth.mean()),float(smooth.min()),'The profile rises substantially and ends without a sustained cooling phase.')
+    return Detection('Uncertain',55,pull if fall>=8 else None,peak,float(smooth.mean()),float(smooth.min()),'The profile is ambiguous; review the classification.')
 
 def band(temp): return -1 if temp<60 else min(int(np.searchsorted(BAND_LOWER_C,temp,side='right')-1),9)
 def assess(value):
-    percent=value*100
-    return 'Underdone and tight' if percent<80 else 'Slightly tight but sliceable' if percent<95 else 'Ideal tenderness' if percent<=105 else 'Very soft and potentially overdone' if percent<=120 else 'Increased risk of mushy or over-rendered texture'
+    p=value*100
+    return 'Underdone and tight' if p<80 else 'Slightly tight but sliceable' if p<95 else 'Ideal tenderness' if p<=105 else 'Very soft and potentially overdone' if p<=120 else 'Increased risk of mushy or over-rendered texture'
 
 def analyse(valid,report,detection,pull_override=None,max_gap=10):
-    pull=pd.Timestamp(pull_override) if pull_override is not None else detection.pull_timestamp; mode=detection.session_type; seconds=np.zeros((2,10)); below=gap_seconds=0.; gaps=0; cumulative=0.; rows=[]
+    pull=pd.Timestamp(pull_override) if pull_override is not None else detection.pull_timestamp; mode=detection.session_type; seconds=np.zeros((2,10)); below=gapseconds=0.; gaps=0; cumulative=0.; rows=[]
     for i in range(len(valid)-1):
         start=pd.Timestamp(valid.timestamp.iloc[i]); end=pd.Timestamp(valid.timestamp.iloc[i+1]); elapsed=(end-start).total_seconds(); temp=float(valid.temperature_c.iloc[i]); status='Analysed'; phase=''; increment=0.
         if elapsed<=0: status='Excluded: non-positive interval'
-        elif elapsed>max_gap: status='Excluded: recording gap'; gaps+=1; gap_seconds+=elapsed
+        elif elapsed>max_gap: status='Excluded: recording gap'; gaps+=1; gapseconds+=elapsed
         else:
             bi=band(temp)
             if bi<0: status='Below model range'; below+=elapsed
@@ -106,32 +97,19 @@ def analyse(valid,report,detection,pull_override=None,max_gap=10):
                     if end<=pull: parts=[(0,elapsed,'Cook')]
                     elif start>=pull: parts=[(1,elapsed,'Hold / cooldown')]
                     else:
-                        cook_seconds=max((pull-start).total_seconds(),0); parts=[(0,cook_seconds,'Cook'),(1,elapsed-cook_seconds,'Hold / cooldown')]
+                        cs=max((pull-start).total_seconds(),0); parts=[(0,cs,'Cook'),(1,elapsed-cs,'Hold / cooldown')]
                 else: parts=[]; status='Unclassified interval'
-                for phase_i,duration,label in parts:
-                    if duration>0: seconds[phase_i,bi]+=duration; increment+=duration/3600*ZONE_RATES[bi]
+                for pi,dur,label in parts:
+                    if dur>0: seconds[pi,bi]+=dur; increment+=dur/3600*ZONE_RATES[bi]
                 phase=' → '.join(dict.fromkeys(x[2] for x in parts))
         cumulative+=increment; rows.append({'Timestamp':start,'Temperature °C':temp,'Next timestamp':end,'Elapsed seconds':elapsed,'Phase':phase,'Status':status,'Incremental rendering':increment,'Accumulated rendering':cumulative})
     records=[]
-    for phase_i,phase_name in enumerate(('Cook','Hold / cooldown')):
+    for pi,name in enumerate(('Cook','Hold / cooldown')):
         for bi in range(10):
-            hours=seconds[phase_i,bi]/3600; records.append({'Phase':phase_name,'Band':bi+1,'Temperature range':BAND_LABELS[bi],'Duration hours':hours,'Rate per hour':ZONE_RATES[bi],'Tenderness contribution':hours*ZONE_RATES[bi]})
-    summary=pd.DataFrame(records); cook=float(summary[summary.Phase=='Cook']['Tenderness contribution'].sum()); hold=float(summary[summary.Phase=='Hold / cooldown']['Tenderness contribution'].sum()); total=cook+hold; complete=mode=='Cook + Hold' and pull is not None
-    return Result(summary,pd.DataFrame(rows),report,detection,gaps,gap_seconds/3600,below/3600,float(seconds.sum()/3600),cook,hold,total,assess(total),complete)
+            hours=seconds[pi,bi]/3600; records.append({'Phase':name,'Band':bi+1,'Temperature range':BAND_LABELS[bi],'Duration hours':hours,'Rate per hour':ZONE_RATES[bi],'Tenderness contribution':hours*ZONE_RATES[bi]})
+    summary=pd.DataFrame(records); cook=float(summary[summary.Phase=='Cook']['Tenderness contribution'].sum()); hold=float(summary[summary.Phase=='Hold / cooldown']['Tenderness contribution'].sum()); total=cook+hold
+    return Result(summary,pd.DataFrame(rows),report,detection,gaps,gapseconds/3600,below/3600,float(seconds.sum()/3600),cook,hold,total,assess(total),mode=='Cook + Hold' and pull is not None)
 
 def demo_data():
-    start=datetime(2026,5,23); minutes=np.arange(0,23*60+1); hours=minutes/60; base=np.interp(hours,np.array([0,1,2,4,6,7.5,9,10,12,16,20,22.75,23]),np.array([8,32,48,62,72,82,90,95,94,91,86,67,65.5]))
-    return pd.DataFrame({'timestamp':[start+timedelta(minutes=int(m)) for m in minutes],'Average Probe Temperature (°C)':np.round(base+.15*np.sin(minutes/40),2)})
-
-def to_excel(results):
-    output=BytesIO()
-    with pd.ExcelWriter(output,engine='openpyxl') as writer:
-        overview=[]
-        for name,result in results.items():
-            detection=result.detection; overview.append({'Probe':name,'Session type':detection.session_type,'Confidence':detection.confidence/100,'Detected pull':detection.pull_timestamp,'Peak °C':detection.peak_temperature,'Average °C':detection.average_temperature,'Minimum °C':detection.minimum_temperature,'Analysed hours':result.analysed_hours,'Cook rendering':result.cook,'Hold rendering':result.hold,'Total rendering':result.total,'Assessment':result.assessment if result.complete else 'Partial session'})
-            safe=re.sub(r'[^A-Za-z0-9 _-]','',name)[:18] or 'Probe'; result.summary.to_excel(writer,sheet_name=(safe+' Summary')[:31],index=False); result.timeline.to_excel(writer,sheet_name=(safe+' Timeline')[:31],index=False)
-        pd.DataFrame(overview).to_excel(writer,sheet_name='Overview',index=False)
-        for ws in writer.book.worksheets:
-            ws.freeze_panes='A2'
-            for col in ws.columns: ws.column_dimensions[col[0].column_letter].width=min(max(len(str(cell.value or '')) for cell in col)+2,42)
-    return output.getvalue()
+    start=datetime(2026,5,23); minutes=np.arange(0,23*60+1); base=np.interp(minutes/60,[0,1,2,4,6,7.5,9,10,12,16,20,22.75,23],[8,32,48,62,72,82,90,95,94,91,86,67,65.5])
+    return pd.DataFrame({'timestamp':[start+timedelta(minutes=int(m)) for m in minutes],'Average Probe Temperature (°C)':np.round(base,2)})

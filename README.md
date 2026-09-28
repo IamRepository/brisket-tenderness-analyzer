@@ -1,17 +1,20 @@
-# Brisket Session Analyser 2.2
+# Brisket Session Analyser 2.4
 
-Version 2.2 is a reliability release.
+## New
+- Upload a combined meat/pit file or an optional second temperature file
+- Review and correct automatic column classifications
+- Roles: Meat, Grate, Controller, Target, Ignore
+- Grate and controller statistics
+- Possible lid-open indications
+- Meat/pit overlay chart
 
-## Fixes
-- Replaced wildcard engine imports with `import brisket_engine as engine`
-- Calls engine functions explicitly, including `engine.detect_columns(...)`
-- Adds clear error messages for file setup, automatic detection and analysis
-- Keeps one-file automatic classification and pull detection
+## Weber terminology
+- Weber Smoque XL built-in pit reading: Controller temperature
+- Weber Connect wired grate probe: Grate temperature
+- Weber Connect internal probe: Meat temperature
 
 ## Run
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
 ```
-
-Use a 10-second maximum gap for second-by-second exports and 70 seconds for one-minute files.

@@ -1,288 +1,64 @@
 from datetime import datetime
 from io import BytesIO
-
 import pandas as pd
 import plotly.express as px
 import streamlit as st
-
 import brisket_engine as engine
+import pit_engine as pit
 
-
-st.set_page_config(
-    page_title="Brisket Session Analyser 2.2",
-    page_icon="🔥",
-    layout="wide",
-)
-
-st.markdown(
-    """
-    <style>
-    .block-container {padding-top: 1.2rem;}
-    .hero {
-        background: linear-gradient(135deg, #17242d, #29404b);
-        color: #ffffff;
-        padding: 24px;
-        border-radius: 18px;
-    }
-    .hero p {color: #eadfd3;}
-    .hero .attribution {
-        color: #d7e4e8;
-        font-size: 0.92rem;
-        margin-top: 0.85rem;
-    }
-    div[data-testid="stMetric"] {
-        background: #fff7ed;
-        border: 1px solid #ead7c2;
-        padding: 13px;
-        border-radius: 13px;
-    }
-    .status {
-        padding: 13px;
-        border-left: 5px solid #5f7d5a;
-        background: #f4f7f1;
-        border-radius: 8px;
-    }
-    </style>
-
-    <div class="hero">
-      <h1>🔥 Brisket Session Analyser 2.2</h1>
-      <p>Upload one probe file. Automatic session classification and pull detection are built in.</p>
-      <p class="attribution">
-        Tenderness methodology inspired by the time-temperature rendering and hot-hold concepts
-        shared by Steve Gow. This is an independent software implementation and is not affiliated
-        with, endorsed by, or maintained by Steve Gow. </p>
-        This tool is developed by Imran Abdul-Majid
-      </p>
-    </div>
-    """,
-    unsafe_allow_html=True,
-)
-
-st.sidebar.header("Analysis settings")
-max_gap = st.sidebar.number_input(
-    "Maximum accepted gap (seconds)",
-    1.0,
-    3600.0,
-    10.0,
-    1.0,
-    help="Use 10 for second-by-second exports and 70 for one-minute data.",
-)
-
-source = st.segmented_control(
-    "Data source",
-    ["Upload probe file", "Try reference brisket"],
-    default="Upload probe file",
-)
-
+st.set_page_config(page_title='Brisket Session Analyser 2.4',page_icon='🔥',layout='wide')
+st.title('🔥 Brisket Session Analyser 2.4')
+st.caption("Based on Steve Gow's brisket rendering and hot-hold methodology. Independent implementation; not affiliated with or endorsed by Steve Gow.")
+st.sidebar.header('Settings')
+max_gap=st.sidebar.number_input('Maximum accepted gap (seconds)',1.,3600.,10.,1.)
+source=st.segmented_control('Data source',['Upload file','Try reference brisket'],default='Upload file')
 
 @st.cache_data
-def load_bytes(data, name):
-    return engine.read_file(BytesIO(data), name)
+def load(data,name): return engine.read_file(BytesIO(data),name)
 
-
-try:
-    if source == "Try reference brisket":
-        df = engine.demo_data()
-        timestamp_col = "timestamp"
-        probes = ["Average Probe Temperature (°C)"]
-        effective_gap = max(max_gap, 70.0)
-        st.info(
-            "The reference profile uses one-minute readings; "
-            "the effective gap threshold is at least 70 seconds."
-        )
-    else:
-        upload = st.file_uploader(
-            "Upload Excel or CSV probe data",
-            type=["xlsx", "xlsm", "xls", "csv"],
-        )
-        if not upload:
-            st.info("Upload a probe file to begin.")
-            st.stop()
-
-        sheets = load_bytes(upload.getvalue(), upload.name)
-        selected_sheet = st.selectbox("Worksheet", list(sheets))
-        df = sheets[selected_sheet]
-
-        detected_timestamp, detected_probes = engine.detect_columns(df)
-        columns = list(df.columns)
-
-        left, right = st.columns([1, 2])
-        timestamp_col = left.selectbox(
-            "Timestamp column",
-            columns,
-            index=columns.index(detected_timestamp),
-        )
-        probes = right.multiselect(
-            "Meat probe column(s)",
-            columns,
-            default=detected_probes,
-        )
-        if not probes:
-            st.warning("Select at least one meat probe.")
-            st.stop()
-
-        effective_gap = float(max_gap)
-except Exception as exc:
-    st.error(f"File setup failed: {exc}")
-    st.stop()
-
-prepared = {}
-detections = {}
-
-try:
-    for probe in probes:
-        valid, report = engine.prepare(df, timestamp_col, probe)
-        prepared[probe] = (valid, report)
-        detections[probe] = engine.classify_session(valid)
-except Exception as exc:
-    st.error(f"Automatic detection failed: {exc}")
-    st.stop()
-
-st.subheader("Automatic detection")
-rows = []
-for probe, detection in detections.items():
-    rows.append(
-        {
-            "Probe": probe,
-            "Session type": detection.session_type,
-            "Confidence": f"{detection.confidence}%",
-            "Detected pull": detection.pull_timestamp,
-            "Peak °C": round(detection.peak_temperature, 1),
-            "Average °C": round(detection.average_temperature, 1),
-            "Minimum °C": round(detection.minimum_temperature, 1),
-        }
-    )
-
-st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
-
-primary = detections[probes[0]]
-override = None
-
-if primary.session_type == "Cook + Hold" and primary.pull_timestamp is not None:
-    st.markdown(
-        f"""
-        <div class="status">
-          <b>Detected pull:</b> {primary.pull_timestamp:%d/%m/%Y %H:%M:%S}
-          &nbsp; <b>Confidence:</b> {primary.confidence}%<br>
-          {primary.reason}
-        </div>
-        """,
-        unsafe_allow_html=True,
-    )
-
-    with st.expander("Advanced: override detected pull time"):
-        if st.checkbox("Override detected pull time"):
-            left, right = st.columns(2)
-            date = left.date_input("Pull date", primary.pull_timestamp.date())
-            selected_time = right.time_input(
-                "Pull time",
-                primary.pull_timestamp.time(),
-                step=60,
-            )
-            override = datetime.combine(date, selected_time)
+if source=='Try reference brisket':
+    df=engine.demo_data(); timestamp_col='timestamp'; meat_cols=['Average Probe Temperature (°C)']; classifications=pd.DataFrame([{'Column':meat_cols[0],'Suggested role':'Meat temperature','Confidence':99}]); effective_gap=max(max_gap,70.)
 else:
-    st.info(f"Detected session: {primary.session_type}. {primary.reason}")
+    primary=st.file_uploader('Upload meat or combined temperature file',type=['xlsx','xlsm','xls','csv'],key='primary')
+    optional=st.file_uploader('Optional second temperature file',type=['xlsx','xlsm','xls','csv'],key='optional')
+    if not primary: st.info('Upload a meat or combined temperature file.'); st.stop()
+    sheets=load(primary.getvalue(),primary.name); sheet=st.selectbox('Primary worksheet',list(sheets)); df=sheets[sheet]
+    timestamp_col,_=engine.detect_columns(df); extra_df=None; extra_timestamp=None
+    classifications=pit.classify_columns(df,timestamp_col); classifications['File']='Primary'
+    if optional:
+        osheets=load(optional.getvalue(),optional.name); osheet=st.selectbox('Optional worksheet',list(osheets)); extra_df=osheets[osheet]
+        extra_timestamp,_=engine.detect_columns(extra_df); extra=pit.classify_columns(extra_df,extra_timestamp); extra['File']='Optional'; classifications=pd.concat([classifications,extra],ignore_index=True)
+    effective_gap=float(max_gap)
 
-if not st.button("Analyse session", type="primary", use_container_width=True):
-    st.stop()
+st.subheader('Review column classifications')
+roles={}
+for i,row in classifications.iterrows():
+    key=f"{row['File']}_{row['Column']}" if 'File' in row else str(row['Column'])
+    roles[key]=st.selectbox(f"{row.get('File','Reference')} • {row['Column']} ({row['Confidence']}% suggested confidence)",pit.ROLES,index=pit.ROLES.index(row['Suggested role']),key='role_'+key)
 
-results = {}
-try:
-    for probe, (valid, report) in prepared.items():
-        detection = detections[probe]
-        local_override = (
-            override
-            if override is not None and detection.session_type == "Cook + Hold"
-            else None
-        )
-        results[str(probe)] = engine.analyse(
-            valid,
-            report,
-            detection,
-            local_override,
-            effective_gap,
-        )
-except Exception as exc:
-    st.error(f"Analysis failed: {exc}")
-    st.stop()
+if not st.button('Analyse session',type='primary',use_container_width=True): st.stop()
+meat_results={}; pit_results={}
+for i,row in classifications.iterrows():
+    filename=row.get('File','Reference'); col=row['Column']; key=f'{filename}_{col}' if 'File' in row else str(col); role=roles[key]
+    active_df=df if filename in ('Primary','Reference') else extra_df; active_time=timestamp_col if filename in ('Primary','Reference') else extra_timestamp
+    prepared=pit.prepare(active_df,active_time,col)
+    if role=='Meat temperature':
+        valid,report=engine.prepare(active_df,active_time,col); detection=engine.classify_session(valid); meat_results[str(col)]=engine.analyse(valid,report,detection,max_gap=effective_gap)
+    elif role in ('Grate temperature','Controller temperature','Target temperature'):
+        pit_results[role]=pit.analyse(prepared,role)
 
-st.subheader("Results")
-for name, result in results.items():
-    with st.expander(name, expanded=len(results) == 1):
-        if not result.complete:
-            st.warning(
-                "Partial session detected. The percentage is the recorded phase "
-                "contribution, not a complete final-tenderness assessment."
-            )
+if not meat_results: st.error('At least one column must be classified as Meat temperature.'); st.stop()
+for name,result in meat_results.items():
+    st.subheader(name); a,b,c,d=st.columns(4); a.metric('Session',result.detection.session_type); b.metric('Cook contribution',f'{result.cook:.1%}'); c.metric('Hold contribution',f'{result.hold:.1%}'); d.metric('Recorded total',f'{result.total:.1%}')
+    chart=result.timeline[result.timeline.Status=='Analysed']; st.plotly_chart(px.line(chart,x='Timestamp',y='Temperature °C',color='Phase' if chart.Phase.nunique()>1 else None),use_container_width=True)
 
-        a, b, c, d = st.columns(4)
-        a.metric("Cook contribution", f"{result.cook:.1%}")
-        b.metric("Hold contribution", f"{result.hold:.1%}")
-        c.metric("Recorded total", f"{result.total:.1%}")
-        d.metric(
-            "Assessment",
-            result.assessment if result.complete else "Partial session",
-        )
+if pit_results:
+    st.subheader('Cooking-environment analysis')
+    for name,result in pit_results.items():
+        with st.expander(name,expanded=True):
+            a,b,c,d=st.columns(4); a.metric('Average',f'{result.average:.1f}°C'); b.metric('Minimum',f'{result.minimum:.1f}°C'); c.metric('Maximum',f'{result.maximum:.1f}°C'); d.metric('Stability',f'{result.stability_score:.0f}/100')
+            st.plotly_chart(px.line(result.timeline,x='timestamp',y='temperature_c',labels={'temperature_c':f'{name} °C'}),use_container_width=True)
+            if len(result.lid_events): st.write('Possible lid-open events'); st.dataframe(result.lid_events,hide_index=True,use_container_width=True)
+    first_meat=next(iter(meat_results.values())); overlay=pit.align(first_meat.timeline,pit_results); melted=overlay.melt(id_vars='timestamp',var_name='Temperature source',value_name='Temperature °C'); st.subheader('Meat and cooking-environment overlay'); st.plotly_chart(px.line(melted,x='timestamp',y='Temperature °C',color='Temperature source'),use_container_width=True)
 
-        tabs = st.tabs(
-            ["Temperature", "Accumulated rendering", "Band calculation", "Data quality"]
-        )
-
-        with tabs[0]:
-            chart = result.timeline[result.timeline.Status == "Analysed"]
-            fig = px.line(
-                chart,
-                x="Timestamp",
-                y="Temperature °C",
-                color="Phase" if chart.Phase.nunique() > 1 else None,
-                color_discrete_map={
-                    "Cook": "#d7652a",
-                    "Hold / cooldown": "#5f7d5a",
-                },
-            )
-            st.plotly_chart(fig, use_container_width=True)
-
-        with tabs[1]:
-            fig = px.line(
-                result.timeline,
-                x="Timestamp",
-                y="Accumulated rendering",
-            )
-            fig.update_yaxes(tickformat=".0%")
-            st.plotly_chart(fig, use_container_width=True)
-
-        with tabs[2]:
-            summary = result.summary[result.summary["Duration hours"] > 0].copy()
-            summary["Duration hours"] = summary["Duration hours"].round(3)
-            summary["Rate per hour"] = summary["Rate per hour"].map(
-                lambda x: f"{x:.1%}"
-            )
-            summary["Tenderness contribution"] = summary[
-                "Tenderness contribution"
-            ].map(lambda x: f"{x:.1%}")
-            st.dataframe(summary, hide_index=True, use_container_width=True)
-
-        with tabs[3]:
-            q1, q2, q3 = st.columns(3)
-            q1.metric("Analysed hours", f"{result.analysed_hours:.3f}")
-            q2.metric("Excluded gap hours", f"{result.excluded_gap_hours:.3f}")
-            q3.metric("Below 60°C hours", f"{result.below_model_hours:.3f}")
-            st.write(
-                "Valid / invalid / duplicates:",
-                result.report.valid_rows,
-                result.report.invalid_rows,
-                result.report.duplicate_timestamps,
-            )
-
-st.download_button(
-    "Download analysis workbook",
-    engine.to_excel(results),
-    "brisket_session_analysis_v2.2.xlsx",
-    "application/vnd.openxmlformats-officedocument.spreadsheetml.sheet",
-    use_container_width=True,
-)
-
-st.caption(
-    "Automatic classification and pull detection are estimates. Review the detected "
-    "pull point and use probe tenderness plus safe food handling alongside the model."
-)
+st.caption('Pit stability and event detections are analytical estimates, not manufacturer-provided Weber metrics.')
