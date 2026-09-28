@@ -56,12 +56,28 @@ def source_label(file_role: str, column: str) -> str:
     return f"{file_role} / {column}"
 
 
-def unique_name(role: str, source_name: str, existing: dict) -> str:
-    if role not in existing:
-        return role
-    candidate = f"{role} — {source_name}"
+def clean_role_label(role: str) -> str:
+    """Return a concise semantic role without changing the configured role value."""
+    return {
+        "🥩 Point": "Point",
+        "🥩 Flat": "Flat",
+        "🍖 Other Meat": "Other Meat",
+        "🌡 Grate": "Grate",
+        "🔥 PID": "PID",
+    }.get(role, role)
+
+
+def profile_label(role: str, file_role: str, column: str, existing: dict) -> str:
+    """Create labels such as 'Point — Probe 1' and 'Flat — Probe 2'."""
+    role_label = clean_role_label(role)
+    base = f"{role_label} — {column}"
+    if base not in existing:
+        return base
+
+    candidate = f"{role_label} — {file_role} / {column}"
     if candidate not in existing:
         return candidate
+
     counter = 2
     while f"{candidate} ({counter})" in existing:
         counter += 1
@@ -320,7 +336,7 @@ for _, row in classifications.iterrows():
         valid, report = engine.prepare(active_df, active_timestamp, column)
         detection = engine.classify_session(valid)
         effective_gap = adaptive_gap_seconds(valid, requested_gap)
-        profile_name = unique_name(selected_role, source_name, meat_results)
+        profile_name = profile_label(selected_role, file_role, str(column), meat_results)
 
         # Pass max_gap by keyword. This avoids accidentally filling pull_override.
         result = engine.analyse(
@@ -335,7 +351,7 @@ for _, row in classifications.iterrows():
 
     elif selected_role in ENVIRONMENT_ROLES:
         prepared = pit.prepare(active_df, active_timestamp, column)
-        environment_name = f"{selected_role} — {source_name}"
+        environment_name = f"{clean_role_label(selected_role)} — {column}"
         pit_results[environment_name] = pit.analyse(
             prepared,
             selected_role,
@@ -449,7 +465,7 @@ if comparison_frames:
         x="Timestamp",
         y="Temperature °C",
         color="Profile",
-        title="All classified meat probes",
+        title="Point and Flat meat-probe profiles",
     )
     st.plotly_chart(
         probe_chart,
