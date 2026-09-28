@@ -19,21 +19,21 @@ def classify_columns(df,timestamp_col):
 
     if any(x in name for x in ('grate','ambient','pit probe','chamber probe')):
 role='🌡 Grate'; confidence=93
- 
+
 elif any(x in name for x in ('controller','smoker','smoque','built-in','oven')):
 role='🔥 PID'; confidence=90
- 
+
 elif any(x in name for x in ('point',)):
 role='🥩 Point'; confidence=95
- 
+
 elif any(x in name for x in ('flat',)):
 role='🥩 Flat'; confidence=95
- 
+
 elif any(x in name for x in ('meat','internal','food','brisket','probe')):
 role='🍖 Other Meat'; confidence=88
         else:
             smooth=valid.rolling(min(21,max(3,len(valid)//50)),center=True,min_periods=1).median(); rise=float(smooth.max()-smooth.iloc[:max(2,len(smooth)//20)].median()); fluct=float(valid.diff().abs().median())
-
+            
 if rise >= 20:
 role='🍖 Other Meat'; confidence=72
  
