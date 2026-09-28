@@ -5,7 +5,6 @@ import pandas as pd
 import brisket_engine as meat
 
 ROLES=['🥩 Point','🥩 Flat','🍖 Other Meat','🌡 Grate','🔥 PID','🚫 Ignore']
-
 @dataclass(frozen=True)
 class PitResult:
     role:str; timeline:pd.DataFrame; average:float; minimum:float; maximum:float; stddev:float; stability_score:float; lid_events:pd.DataFrame
