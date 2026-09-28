@@ -1,5 +1,4 @@
-from __future__ import annotations
-
+from datetime import datetime
 from io import BytesIO
 
 import pandas as pd
@@ -11,6 +10,10 @@ import pit_engine as pit
 
 
 APP_VERSION = "2.4.3"
+MEAT_ROLES = ("🥩 Point", "🥩 Flat", "🍖 Other Meat")
+ENVIRONMENT_ROLES = ("🌡 Grate", "🔥 PID")
+IGNORE_ROLE = "🚫 Ignore"
+
 
 st.set_page_config(
     page_title=f"Brisket Session Analyser {APP_VERSION}",
@@ -28,13 +31,12 @@ st.sidebar.header("Settings")
 max_gap = st.sidebar.number_input(
     "Maximum accepted gap (seconds)",
     min_value=1.0,
-    max_value=3600.0,
+    max_value=7200.0,
     value=10.0,
     step=1.0,
     help=(
-        "Intervals longer than this are treated as missing data. "
-        "Use about 10 seconds for second-by-second exports, "
-        "40 seconds for 30-second data and 70 seconds for one-minute data."
+        "Intervals longer than this are excluded. The analyser also protects "
+        "regularly sampled files by adapting to the file's normal interval."
     ),
 )
 
@@ -46,389 +48,604 @@ source = st.segmented_control(
 
 
 @st.cache_data
-def load_workbook_bytes(data: bytes, filename: str):
-    return engine.read_file(BytesIO(data), filename)
+def load_file(data: bytes, name: str):
+    return engine.read_file(BytesIO(data), name)
 
 
-def elapsed_hours_by_phase(result) -> tuple[float, float]:
-    """Return Cook and Hold hours from accepted intervals only.
+def source_label(file_role: str, column: str) -> str:
+    return f"{file_role} / {column}"
 
-    The previous interface could confuse total recorded duration with phase
-    duration. This helper sums the actual elapsed seconds assigned to each
-    phase after gap filtering.
-    """
-    timeline = result.timeline.copy()
 
-    if timeline.empty:
-        return 0.0, 0.0
+def unique_name(role: str, source_name: str, existing: dict) -> str:
+    if role not in existing:
+        return role
+    candidate = f"{role} — {source_name}"
+    if candidate not in existing:
+        return candidate
+    counter = 2
+    while f"{candidate} ({counter})" in existing:
+        counter += 1
+    return f"{candidate} ({counter})"
 
-    timeline = timeline[timeline["Status"] == "Analysed"].copy()
-    elapsed = pd.to_numeric(timeline["Elapsed seconds"], errors="coerce").fillna(0.0)
-    phase = timeline["Phase"].fillna("").astype(str)
 
-    cook_seconds = float(elapsed[phase.str.contains("Cook", case=False, regex=False)].sum())
-    hold_seconds = float(
-        elapsed[
-            phase.str.contains("Hold", case=False, regex=False)
-            | phase.str.contains("cooldown", case=False, regex=False)
-        ].sum()
+def adaptive_gap_seconds(valid: pd.DataFrame, requested_gap: float) -> float:
+    """Allow regular 15-second, 30-second, 1-minute or 15-minute test files."""
+    intervals = (
+        valid["timestamp"]
+        .sort_values()
+        .diff()
+        .dt.total_seconds()
+        .dropna()
     )
-
-    # An interval crossing the detected pull point may contain both labels.
-    # If the engine supplies a split interval as one row, avoid double-counting
-    # by allocating the row according to the incremental rendering split is not
-    # recoverable here. Current engine normally places the pull on an existing
-    # sample, so this is a defensive fallback only.
-    both = phase.str.contains("Cook", case=False, regex=False) & phase.str.contains(
-        "Hold", case=False, regex=False
-    )
-    if both.any():
-        overlap = float(elapsed[both].sum())
-        cook_seconds -= overlap / 2.0
-        hold_seconds -= overlap / 2.0
-
-    return max(cook_seconds, 0.0) / 3600.0, max(hold_seconds, 0.0) / 3600.0
+    intervals = intervals[intervals > 0]
+    if intervals.empty:
+        return float(requested_gap)
+    normal_interval = float(intervals.median())
+    return max(float(requested_gap), normal_interval * 1.25)
 
 
-def make_multi_probe_frame(meat_results: dict) -> pd.DataFrame:
-    """Build a tidy frame containing every valid meat-probe series."""
-    frames = []
+def prepare_phase_statistics(valid: pd.DataFrame, detection) -> dict:
+    """Calculate phase durations and weighted temperatures directly from valid data."""
+    work = valid.copy().sort_values("timestamp").reset_index(drop=True)
+    work["next_timestamp"] = work["timestamp"].shift(-1)
+    work["elapsed_seconds"] = (
+        work["next_timestamp"] - work["timestamp"]
+    ).dt.total_seconds()
+    work = work[work["elapsed_seconds"].notna() & (work["elapsed_seconds"] > 0)]
 
-    for probe_name, result in meat_results.items():
-        timeline = result.timeline.copy()
-        if timeline.empty:
-            continue
+    if work.empty:
+        return {
+            "cook_hours": 0.0,
+            "hold_hours": 0.0,
+            "average_cook": None,
+            "average_hold": None,
+        }
 
-        required = {"Timestamp", "Temperature °C", "Status"}
-        if not required.issubset(timeline.columns):
-            continue
+    pull = detection.pull_timestamp
+    if detection.session_type == "Cook Only":
+        cook = work
+        hold = work.iloc[0:0]
+    elif detection.session_type in ("Hold Only", "Calibration / Hold Test"):
+        cook = work.iloc[0:0]
+        hold = work
+    elif pull is not None:
+        pull = pd.Timestamp(pull)
+        cook = work[work["timestamp"] < pull]
+        hold = work[work["timestamp"] >= pull]
+    else:
+        cook = work.iloc[0:0]
+        hold = work.iloc[0:0]
 
-        timeline = timeline[timeline["Status"] == "Analysed"]
-        timeline = timeline[["Timestamp", "Temperature °C"]].copy()
-        timeline["Temperature °C"] = pd.to_numeric(
-            timeline["Temperature °C"], errors="coerce"
-        )
-        timeline.dropna(subset=["Timestamp", "Temperature °C"], inplace=True)
+    def weighted_average(frame):
+        if frame.empty:
+            return None
+        weights = frame["elapsed_seconds"].clip(lower=0)
+        if float(weights.sum()) == 0:
+            return float(frame["temperature_c"].mean())
+        return float((frame["temperature_c"] * weights).sum() / weights.sum())
 
-        if timeline.empty:
-            continue
-
-        timeline["Probe"] = str(probe_name)
-        frames.append(timeline)
-
-    if not frames:
-        return pd.DataFrame(columns=["Timestamp", "Temperature °C", "Probe"])
-
-    comparison = pd.concat(frames, ignore_index=True)
-    comparison.sort_values(["Timestamp", "Probe"], inplace=True)
-    return comparison
+    return {
+        "cook_hours": float(cook["elapsed_seconds"].sum()) / 3600.0,
+        "hold_hours": float(hold["elapsed_seconds"].sum()) / 3600.0,
+        "average_cook": weighted_average(cook),
+        "average_hold": weighted_average(hold),
+    }
 
 
-def role_key(file_label: str, column_name: str) -> str:
-    return f"{file_label}_{column_name}"
+def metric_temperature(value):
+    return "N/A" if value is None else f"{value:.1f}°C"
 
 
-# ---------------------------------------------------------------------------
-# Upload and column classification
-# ---------------------------------------------------------------------------
+# -----------------------------------------------------------------------------
+# Step 1: Upload source files
+# -----------------------------------------------------------------------------
 if source == "Try reference brisket":
-    primary_df = engine.demo_data()
-    primary_timestamp = "timestamp"
-    optional_df = None
-    optional_timestamp = None
-
+    primary_name = "Reference brisket"
+    df = engine.demo_data()
+    timestamp_col = "timestamp"
     classifications = pd.DataFrame(
         [
             {
                 "Column": "Average Probe Temperature (°C)",
-                "Suggested role": "Meat temperature",
+                "Suggested role": "🍖 Other Meat",
                 "Confidence": 99,
                 "File": "Reference",
             }
         ]
     )
-    effective_gap = max(float(max_gap), 70.0)
-    st.info(
-        "The reference profile uses one-minute readings. "
-        "The effective maximum gap is therefore at least 70 seconds."
-    )
+    extra_df = None
+    extra_timestamp = None
+    optional_name = None
+    requested_gap = max(float(max_gap), 70.0)
 else:
-    primary_file = st.file_uploader(
-        "Upload meat or combined temperature file",
+    st.subheader("Step 1: Upload temperature files")
+    primary = st.file_uploader(
+        "Primary temperature file",
         type=["xlsx", "xlsm", "xls", "csv"],
         key="primary_file",
     )
-    optional_file = st.file_uploader(
-        "Optional second temperature file",
+    optional = st.file_uploader(
+        "Secondary temperature file (optional)",
         type=["xlsx", "xlsm", "xls", "csv"],
-        key="optional_file",
+        key="secondary_file",
     )
 
-    if primary_file is None:
-        st.info("Upload a meat or combined temperature file to begin.")
+    if primary is None:
+        st.info("Upload a primary temperature file to begin.")
         st.stop()
 
-    try:
-        primary_sheets = load_workbook_bytes(
-            primary_file.getvalue(), primary_file.name
+    primary_name = primary.name
+    primary_sheets = load_file(primary.getvalue(), primary.name)
+    primary_sheet = st.selectbox(
+        "Primary worksheet",
+        list(primary_sheets),
+        key="primary_sheet",
+    )
+    df = primary_sheets[primary_sheet]
+    timestamp_col, _ = engine.detect_columns(df)
+
+    classifications = pit.classify_columns(df, timestamp_col)
+    classifications["File"] = "Primary"
+
+    extra_df = None
+    extra_timestamp = None
+    optional_name = None
+
+    if optional is not None:
+        optional_name = optional.name
+        secondary_sheets = load_file(optional.getvalue(), optional.name)
+        secondary_sheet = st.selectbox(
+            "Secondary worksheet",
+            list(secondary_sheets),
+            key="secondary_sheet",
         )
-        primary_sheet = st.selectbox(
-            "Primary worksheet", list(primary_sheets), key="primary_sheet"
+        extra_df = secondary_sheets[secondary_sheet]
+        extra_timestamp, _ = engine.detect_columns(extra_df)
+        secondary_classifications = pit.classify_columns(
+            extra_df,
+            extra_timestamp,
         )
-        primary_df = primary_sheets[primary_sheet]
-        primary_timestamp, _ = engine.detect_columns(primary_df)
+        secondary_classifications["File"] = "Secondary"
+        classifications = pd.concat(
+            [classifications, secondary_classifications],
+            ignore_index=True,
+        )
 
-        classifications = pit.classify_columns(primary_df, primary_timestamp)
-        classifications["File"] = "Primary"
+    requested_gap = float(max_gap)
 
-        optional_df = None
-        optional_timestamp = None
 
-        if optional_file is not None:
-            optional_sheets = load_workbook_bytes(
-                optional_file.getvalue(), optional_file.name
-            )
-            optional_sheet = st.selectbox(
-                "Optional worksheet", list(optional_sheets), key="optional_sheet"
-            )
-            optional_df = optional_sheets[optional_sheet]
-            optional_timestamp, _ = engine.detect_columns(optional_df)
+# -----------------------------------------------------------------------------
+# Step 2: Assign roles
+# -----------------------------------------------------------------------------
+st.subheader("Step 2: Assign probe roles")
+st.caption(
+    "Tell the analyser how each temperature channel was used. "
+    "Point, Flat and Other Meat are analysed independently."
+)
 
-            optional_classifications = pit.classify_columns(
-                optional_df, optional_timestamp
-            )
-            optional_classifications["File"] = "Optional"
-            classifications = pd.concat(
-                [classifications, optional_classifications], ignore_index=True
-            )
-
-        effective_gap = float(max_gap)
-
-    except Exception as exc:
-        st.error(f"File setup failed: {exc}")
-        st.stop()
-
-if classifications.empty:
-    st.error("No usable temperature columns were found.")
-    st.stop()
-
-st.subheader("Review column classifications")
 roles = {}
+for file_role, colour, icon in (
+    ("Primary", "#eaf3ff", "🟦"),
+    ("Secondary", "#edf9ef", "🟩"),
+    ("Reference", "#fff6df", "🟨"),
+):
+    group = classifications[classifications["File"] == file_role]
+    if group.empty:
+        continue
 
+    displayed_name = (
+        primary_name
+        if file_role in ("Primary", "Reference")
+        else optional_name
+    )
+    st.markdown(
+        f"""
+        <div style="background:{colour}; padding:12px 16px; border-radius:10px;
+                    margin:14px 0 8px 0; border:1px solid #d8dee6;">
+          <strong>{icon} {file_role.upper()} FILE</strong><br>
+          <span style="font-size:0.9rem; color:#4d5966;">{displayed_name or file_role}</span>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    for _, row in group.iterrows():
+        role_key = f"{file_role}_{row['Column']}"
+        suggested = row["Suggested role"]
+        suggested_index = (
+            pit.ROLES.index(suggested)
+            if suggested in pit.ROLES
+            else pit.ROLES.index(IGNORE_ROLE)
+        )
+        roles[role_key] = st.selectbox(
+            f"{row['Column']} ({row['Confidence']}% suggested confidence)",
+            pit.ROLES,
+            index=suggested_index,
+            key=f"role_{role_key}",
+        )
+
+st.markdown("#### Detected configuration")
+configuration_rows = []
 for _, row in classifications.iterrows():
-    file_label = str(row["File"])
-    column_name = str(row["Column"])
-    suggested_role = str(row["Suggested role"])
-    confidence = int(row["Confidence"])
-    key = role_key(file_label, column_name)
+    file_role = row["File"]
+    role_key = f"{file_role}_{row['Column']}"
+    selected_role = roles[role_key]
+    if selected_role != IGNORE_ROLE:
+        configuration_rows.append(
+            {
+                "Role": selected_role,
+                "Source": source_label(file_role, str(row["Column"])),
+            }
+        )
 
-    default_index = (
-        pit.ROLES.index(suggested_role) if suggested_role in pit.ROLES else 0
+if configuration_rows:
+    st.dataframe(
+        pd.DataFrame(configuration_rows),
+        hide_index=True,
+        use_container_width=True,
     )
-
-    roles[key] = st.selectbox(
-        f"{file_label} • {column_name} ({confidence}% suggested confidence)",
-        pit.ROLES,
-        index=default_index,
-        key=f"role_{key}",
-    )
+else:
+    st.warning("All detected temperature columns are set to Ignore.")
 
 if not st.button("Analyse session", type="primary", use_container_width=True):
     st.stop()
 
-# ---------------------------------------------------------------------------
-# Analysis
-# ---------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Step 3: Analyse all selected profiles
+# -----------------------------------------------------------------------------
 meat_results = {}
+meat_valid_data = {}
+meat_sources = {}
 pit_results = {}
-analysis_errors = []
 
 for _, row in classifications.iterrows():
-    file_label = str(row["File"])
-    column_name = row["Column"]
-    role = roles[role_key(file_label, str(column_name))]
+    file_role = row["File"]
+    column = row["Column"]
+    role_key = f"{file_role}_{column}"
+    selected_role = roles[role_key]
 
-    if role == "Ignore":
+    if selected_role == IGNORE_ROLE:
         continue
 
-    if file_label in ("Primary", "Reference"):
-        active_df = primary_df
-        active_timestamp = primary_timestamp
-    else:
-        active_df = optional_df
-        active_timestamp = optional_timestamp
+    active_df = df if file_role in ("Primary", "Reference") else extra_df
+    active_timestamp = (
+        timestamp_col
+        if file_role in ("Primary", "Reference")
+        else extra_timestamp
+    )
+    source_name = source_label(file_role, str(column))
 
-    try:
-        prepared_environment = pit.prepare(
-            active_df, active_timestamp, column_name
+    if selected_role in MEAT_ROLES:
+        valid, report = engine.prepare(active_df, active_timestamp, column)
+        detection = engine.classify_session(valid)
+        effective_gap = adaptive_gap_seconds(valid, requested_gap)
+        profile_name = unique_name(selected_role, source_name, meat_results)
+
+        # Pass max_gap by keyword. This avoids accidentally filling pull_override.
+        result = engine.analyse(
+            valid,
+            report,
+            detection,
+            max_gap=effective_gap,
         )
+        meat_results[profile_name] = result
+        meat_valid_data[profile_name] = valid
+        meat_sources[profile_name] = source_name
 
-        if role in ("Meat temperature", "🥩 Point", "🥩 Flat", "🍖 Other Meat"):
-            valid, report = engine.prepare(
-                active_df, active_timestamp, column_name
-            )
-            detection = engine.classify_session(valid)
-            result = engine.analyse(
-                valid,
-                report,
-                detection,
-                max_gap=effective_gap,
-            )
-            meat_results[f"{file_label}: {column_name}"] = result
-
-        elif role in (
-            "Grate temperature",
-            "Controller temperature",
-            "Target temperature",
-            "🌡 Grate",
-            "🔥 PID",
-        ):
-            normalised_role = {
-                "🌡 Grate": "Grate temperature",
-                "🔥 PID": "Controller temperature",
-            }.get(role, role)
-            pit_results[normalised_role] = pit.analyse(
-                prepared_environment, normalised_role
-            )
-
-    except Exception as exc:
-        analysis_errors.append(f"{file_label} • {column_name}: {exc}")
-
-for message in analysis_errors:
-    st.error(message)
+    elif selected_role in ENVIRONMENT_ROLES:
+        prepared = pit.prepare(active_df, active_timestamp, column)
+        environment_name = f"{selected_role} — {source_name}"
+        pit_results[environment_name] = pit.analyse(
+            prepared,
+            selected_role,
+        )
 
 if not meat_results:
-    st.error("At least one column must be classified as a meat temperature.")
+    st.error(
+        "At least one column must be classified as Point, Flat or Other Meat."
+    )
     st.stop()
 
-# ---------------------------------------------------------------------------
-# Multi-probe comparison: fixed by using tidy, concatenated probe data.
-# ---------------------------------------------------------------------------
-st.subheader("Multi-probe comparison")
-comparison = make_multi_probe_frame(meat_results)
 
-if comparison.empty:
-    st.info("No valid probe readings were available for the comparison chart.")
-else:
-    comparison_chart = px.line(
-        comparison,
+# -----------------------------------------------------------------------------
+# Session detection summary
+# -----------------------------------------------------------------------------
+st.subheader("Session detection summary")
+summary_rows = []
+phase_stats_by_profile = {}
+
+for profile_name, result in meat_results.items():
+    detection = result.detection
+    phase_stats = prepare_phase_statistics(
+        meat_valid_data[profile_name],
+        detection,
+    )
+    phase_stats_by_profile[profile_name] = phase_stats
+
+    summary_rows.append(
+        {
+            "Profile": profile_name,
+            "Source": meat_sources[profile_name],
+            "Session type": detection.session_type,
+            "Confidence": f"{detection.confidence}%",
+            "Detected pull": detection.pull_timestamp,
+            "Peak °C": round(detection.peak_temperature, 1),
+            "Average °C": round(detection.average_temperature, 1),
+            "Minimum °C": round(detection.minimum_temperature, 1),
+            "Cook hours": round(phase_stats["cook_hours"], 2),
+            "Hold hours": round(phase_stats["hold_hours"], 2),
+            "Average cook °C": (
+                round(phase_stats["average_cook"], 1)
+                if phase_stats["average_cook"] is not None
+                else None
+            ),
+            "Average hold °C": (
+                round(phase_stats["average_hold"], 1)
+                if phase_stats["average_hold"] is not None
+                else None
+            ),
+        }
+    )
+
+st.dataframe(
+    pd.DataFrame(summary_rows),
+    hide_index=True,
+    use_container_width=True,
+)
+
+
+# -----------------------------------------------------------------------------
+# Multi-probe comparison
+# -----------------------------------------------------------------------------
+st.subheader("Multi-probe comparison")
+comparison_rows = []
+comparison_frames = []
+
+for profile_name, result in meat_results.items():
+    comparison_rows.append(
+        {
+            "Profile": profile_name,
+            "Source": meat_sources[profile_name],
+            "Cook contribution": result.cook,
+            "Hold contribution": result.hold,
+            "Recorded total": result.total,
+            "Assessment": result.assessment if result.complete else "Partial session",
+            "Analysed hours": result.analysed_hours,
+        }
+    )
+
+    # Build the comparison chart from the validated probe data, not filtered
+    # timeline rows. This guarantees that every selected meat probe is plotted.
+    profile_frame = meat_valid_data[profile_name][
+        ["timestamp", "temperature_c"]
+    ].copy()
+    profile_frame.columns = ["Timestamp", "Temperature °C"]
+    profile_frame["Profile"] = profile_name
+    comparison_frames.append(profile_frame)
+
+comparison_df = pd.DataFrame(comparison_rows)
+comparison_display = comparison_df.copy()
+for percentage_column in (
+    "Cook contribution",
+    "Hold contribution",
+    "Recorded total",
+):
+    comparison_display[percentage_column] = comparison_display[percentage_column].map(
+        lambda value: f"{value:.1%}"
+    )
+comparison_display["Analysed hours"] = comparison_display["Analysed hours"].round(2)
+
+st.dataframe(
+    comparison_display,
+    hide_index=True,
+    use_container_width=True,
+)
+
+if comparison_frames:
+    combined_meat = pd.concat(comparison_frames, ignore_index=True)
+    probe_chart = px.line(
+        combined_meat,
         x="Timestamp",
         y="Temperature °C",
-        color="Probe",
-        labels={
-            "Timestamp": "Time",
-            "Temperature °C": "Internal temperature (°C)",
-        },
+        color="Profile",
+        title="All classified meat probes",
     )
-    comparison_chart.update_layout(
-        height=480,
-        legend_title_text="Probe",
+    st.plotly_chart(
+        probe_chart,
+        use_container_width=True,
+        key="all_classified_meat_probes_chart",
     )
-    st.plotly_chart(comparison_chart, use_container_width=True)
+else:
+    st.info("No valid probe readings were available for the comparison chart.")
 
-# ---------------------------------------------------------------------------
-# Per-probe results and corrected phase durations.
-# ---------------------------------------------------------------------------
+
+# -----------------------------------------------------------------------------
+# Detailed analysis for each meat probe
+# -----------------------------------------------------------------------------
 st.subheader("Meat-probe analysis")
 
-for name, result in meat_results.items():
-    cook_hours, hold_hours = elapsed_hours_by_phase(result)
+for profile_index, (profile_name, result) in enumerate(meat_results.items()):
+    detection = result.detection
+    phase_stats = phase_stats_by_profile[profile_name]
+    safe_key = f"meat_{profile_index}"
 
-    with st.expander(name, expanded=len(meat_results) == 1):
-        row_1 = st.columns(4)
-        row_1[0].metric("Session", result.detection.session_type)
-        row_1[1].metric("Cook duration", f"{cook_hours:.2f} h")
-        row_1[2].metric("Hold duration", f"{hold_hours:.2f} h")
-        row_1[3].metric(
+    with st.expander(
+        f"{profile_name} — {meat_sources[profile_name]}",
+        expanded=len(meat_results) == 1,
+    ):
+        row1a, row1b, row1c, row1d = st.columns(4)
+        row1a.metric("Session", detection.session_type)
+        row1b.metric("Confidence", f"{detection.confidence}%")
+        row1c.metric(
             "Detected pull",
-            result.detection.pull_timestamp.strftime("%d/%m/%Y %H:%M:%S")
-            if result.detection.pull_timestamp is not None
+            detection.pull_timestamp.strftime("%d/%m/%Y %H:%M")
+            if detection.pull_timestamp is not None
             else "Not detected",
         )
+        row1d.metric("Peak temperature", f"{detection.peak_temperature:.1f}°C")
 
-        row_2 = st.columns(4)
-        row_2[0].metric("Cook contribution", f"{result.cook:.1%}")
-        row_2[1].metric("Hold contribution", f"{result.hold:.1%}")
-        row_2[2].metric("Recorded total", f"{result.total:.1%}")
-        row_2[3].metric(
+        row2a, row2b, row2c, row2d = st.columns(4)
+        row2a.metric("Cook contribution", f"{result.cook:.1%}")
+        row2b.metric("Hold contribution", f"{result.hold:.1%}")
+        row2c.metric("Recorded total", f"{result.total:.1%}")
+        row2d.metric(
             "Assessment",
             result.assessment if result.complete else "Partial session",
         )
 
-        accepted = result.timeline[result.timeline["Status"] == "Analysed"]
-        probe_chart = px.line(
-            accepted,
-            x="Timestamp",
-            y="Temperature °C",
-            color="Phase" if accepted["Phase"].nunique() > 1 else None,
-            labels={"Timestamp": "Time"},
+        row3a, row3b, row3c, row3d = st.columns(4)
+        row3a.metric("Cook duration", f"{phase_stats['cook_hours']:.2f} h")
+        row3b.metric("Hold duration", f"{phase_stats['hold_hours']:.2f} h")
+        row3c.metric(
+            "Average cook temperature",
+            metric_temperature(phase_stats["average_cook"]),
         )
-        st.plotly_chart(probe_chart, use_container_width=True)
+        row3d.metric(
+            "Average hold temperature",
+            metric_temperature(phase_stats["average_hold"]),
+        )
 
-        with st.expander("Data quality and phase totals"):
-            st.write(f"Analysed time above 60°C: {result.analysed_hours:.3f} h")
-            st.write(f"Cook duration assigned: {cook_hours:.3f} h")
-            st.write(f"Hold duration assigned: {hold_hours:.3f} h")
-            st.write(f"Excluded gap time: {result.excluded_gap_hours:.3f} h")
-            st.write(f"Time below 60°C: {result.below_model_hours:.3f} h")
+        tabs = st.tabs(
+            [
+                "Temperature",
+                "Accumulated rendering",
+                "Band calculation",
+                "Data quality",
+            ]
+        )
 
-# ---------------------------------------------------------------------------
-# Pit/environment results.
-# ---------------------------------------------------------------------------
+        with tabs[0]:
+            temperature_frame = meat_valid_data[profile_name][
+                ["timestamp", "temperature_c"]
+            ].copy()
+            temperature_frame.columns = ["Timestamp", "Temperature °C"]
+            temperature_chart = px.line(
+                temperature_frame,
+                x="Timestamp",
+                y="Temperature °C",
+                title=profile_name,
+            )
+            st.plotly_chart(
+                temperature_chart,
+                use_container_width=True,
+                key=f"{safe_key}_temperature_chart",
+            )
+
+        with tabs[1]:
+            rendering_chart = px.line(
+                result.timeline,
+                x="Timestamp",
+                y="Accumulated rendering",
+                title=f"Accumulated rendering — {profile_name}",
+            )
+            rendering_chart.update_yaxes(tickformat=".0%")
+            st.plotly_chart(
+                rendering_chart,
+                use_container_width=True,
+                key=f"{safe_key}_rendering_chart",
+            )
+
+        with tabs[2]:
+            band_summary = result.summary[
+                result.summary["Duration hours"] > 0
+            ].copy()
+            band_summary["Duration hours"] = band_summary["Duration hours"].round(3)
+            band_summary["Rate per hour"] = band_summary["Rate per hour"].map(
+                lambda value: f"{value:.1%}"
+            )
+            band_summary["Tenderness contribution"] = band_summary[
+                "Tenderness contribution"
+            ].map(lambda value: f"{value:.1%}")
+            st.dataframe(
+                band_summary,
+                hide_index=True,
+                use_container_width=True,
+                key=f"{safe_key}_band_table",
+            )
+
+        with tabs[3]:
+            quality1, quality2, quality3 = st.columns(3)
+            quality1.metric("Analysed hours", f"{result.analysed_hours:.3f}")
+            quality2.metric("Excluded gap hours", f"{result.excluded_gap_hours:.3f}")
+            quality3.metric("Below 60°C hours", f"{result.below_model_hours:.3f}")
+            st.write(
+                "Valid / invalid / duplicates:",
+                result.report.valid_rows,
+                result.report.invalid_rows,
+                result.report.duplicate_timestamps,
+            )
+
+
+# -----------------------------------------------------------------------------
+# Environmental analysis and all-source overlay
+# -----------------------------------------------------------------------------
 if pit_results:
     st.subheader("Cooking-environment analysis")
 
-    for name, result in pit_results.items():
-        with st.expander(name, expanded=True):
-            metrics = st.columns(4)
-            metrics[0].metric("Average", f"{result.average:.1f}°C")
-            metrics[1].metric("Minimum", f"{result.minimum:.1f}°C")
-            metrics[2].metric("Maximum", f"{result.maximum:.1f}°C")
-            metrics[3].metric("Stability", f"{result.stability_score:.0f}/100")
+    for environment_index, (environment_name, result) in enumerate(
+        pit_results.items()
+    ):
+        safe_key = f"environment_{environment_index}"
+        with st.expander(environment_name, expanded=True):
+            env1, env2, env3, env4 = st.columns(4)
+            env1.metric("Average", f"{result.average:.1f}°C")
+            env2.metric("Minimum", f"{result.minimum:.1f}°C")
+            env3.metric("Maximum", f"{result.maximum:.1f}°C")
+            env4.metric("Stability", f"{result.stability_score:.0f}/100")
 
             environment_chart = px.line(
                 result.timeline,
                 x="timestamp",
                 y="temperature_c",
-                labels={
-                    "timestamp": "Time",
-                    "temperature_c": f"{name} (°C)",
-                },
+                title=environment_name,
+                labels={"temperature_c": "Temperature °C"},
             )
-            st.plotly_chart(environment_chart, use_container_width=True)
+            st.plotly_chart(
+                environment_chart,
+                use_container_width=True,
+                key=f"{safe_key}_chart",
+            )
 
-            if not result.lid_events.empty:
+            if len(result.lid_events):
                 st.write("Possible lid-open events")
                 st.dataframe(
                     result.lid_events,
                     hide_index=True,
                     use_container_width=True,
+                    key=f"{safe_key}_lid_events",
                 )
 
-    first_meat = next(iter(meat_results.values()))
-    overlay = pit.align(first_meat.timeline, pit_results)
+    overlay_frames = []
 
-    value_columns = [
-        column for column in overlay.columns if column != "timestamp"
-    ]
-    overlay_long = overlay.melt(
-        id_vars="timestamp",
-        value_vars=value_columns,
-        var_name="Temperature source",
-        value_name="Temperature °C",
-    ).dropna(subset=["Temperature °C"])
+    for profile_name, valid in meat_valid_data.items():
+        frame = valid[["timestamp", "temperature_c"]].copy()
+        frame.columns = ["timestamp", "Temperature °C"]
+        frame["Temperature source"] = profile_name
+        overlay_frames.append(frame)
 
-    st.subheader("Meat and cooking-environment overlay")
-    if overlay_long.empty:
-        st.info("No overlapping meat and environment readings were found.")
-    else:
-        overlay_chart = px.line(
-            overlay_long,
-            x="timestamp",
-            y="Temperature °C",
-            color="Temperature source",
-        )
-        st.plotly_chart(overlay_chart, use_container_width=True)
+    for environment_name, result in pit_results.items():
+        frame = result.timeline[["timestamp", "temperature_c"]].copy()
+        frame.columns = ["timestamp", "Temperature °C"]
+        frame["Temperature source"] = environment_name
+        overlay_frames.append(frame)
+
+    all_sources = pd.concat(overlay_frames, ignore_index=True)
+    all_sources.sort_values("timestamp", inplace=True)
+
+    overlay_chart = px.line(
+        all_sources,
+        x="timestamp",
+        y="Temperature °C",
+        color="Temperature source",
+        title="Meat and cooking-environment overlay",
+    )
+    st.plotly_chart(
+        overlay_chart,
+        use_container_width=True,
+        key="meat_and_environment_overlay_chart",
+    )
+
 
 st.caption(
     "Pit stability and event detections are analytical estimates, "
