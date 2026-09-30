@@ -11,7 +11,7 @@ import brisket_engine as engine
 import pit_engine as pit
 from pdf_report import build_pdf_report
 
-APP_VERSION = "2.6.3"
+APP_VERSION = "2.6.4"
 POINT = "🥩 Brisket - Point"
 FLAT = "🥩 Brisket - Flat"
 COOK_PID = "🔥 Cook Environment - PID"
@@ -103,26 +103,29 @@ def phase_stats(valid, detection):
 
 
 def derive_transfer_time(meat_results):
-    """Return the median detected pull time without epoch or precision conversion.
+    """Derive transfer only from full Cook + Hold profiles.
 
-    For an even number of pull times, the boundary is the exact midpoint between
-    the two central timestamps. For an odd number, it is the central timestamp.
+    Secondary hold-only or calibration probe streams are excluded because
+    their peaks do not represent the smoker pull.
     """
     pulls = sorted(
         pd.Timestamp(item["result"].detection.pull_timestamp)
         for item in meat_results.values()
-        if item["result"].detection.pull_timestamp is not None
+        if item["result"].detection.session_type == "Cook + Hold"
+        and item["result"].detection.pull_timestamp is not None
     )
     if not pulls:
+        pulls = sorted(
+            pd.Timestamp(item["result"].detection.pull_timestamp)
+            for item in meat_results.values()
+            if item["result"].detection.pull_timestamp is not None
+        )
+    if not pulls:
         return None
-
     middle = len(pulls) // 2
-    if len(pulls) % 2 == 1:
+    if len(pulls) % 2:
         return pulls[middle]
-
-    lower = pulls[middle - 1]
-    upper = pulls[middle]
-    return lower + (upper - lower) / 2
+    return pulls[middle - 1] + (pulls[middle] - pulls[middle - 1]) / 2
 
 
 def segment_environment(prepared, role, transfer_time):
@@ -134,6 +137,49 @@ def segment_environment(prepared, role, transfer_time):
     if role == HOLD_ENV:
         return prepared[prepared["timestamp"] >= transfer_time].copy()
     return prepared.copy()
+
+
+def stream_interval_seconds(frame):
+    intervals = frame["timestamp"].sort_values().diff().dt.total_seconds().dropna()
+    intervals = intervals[intervals > 0]
+    return float(intervals.median()) if not intervals.empty else None
+
+
+def align_environment_to_reference(reference, streams, phase_start=None, phase_end=None):
+    """Align environment streams inside one phase without interpolation."""
+    aligned = reference[["timestamp"]].drop_duplicates().sort_values("timestamp").copy()
+    if phase_start is not None:
+        aligned = aligned[aligned["timestamp"] >= phase_start]
+    if phase_end is not None:
+        aligned = aligned[aligned["timestamp"] < phase_end]
+    columns = []
+    for label, result in streams.items():
+        stream = result.timeline[["timestamp", "temperature_c"]].dropna().sort_values("timestamp")
+        if stream.empty:
+            continue
+        interval = stream_interval_seconds(stream)
+        tolerance = max((interval or 30.0) * 1.5, 30.0)
+        stream = stream.rename(columns={"temperature_c": label})
+        aligned = pd.merge_asof(
+            aligned.sort_values("timestamp"), stream, on="timestamp",
+            direction="nearest", tolerance=pd.Timedelta(seconds=tolerance),
+        )
+        columns.append(label)
+    if not columns:
+        return pd.DataFrame()
+    aligned["Environment aggregate °C"] = aligned[columns].mean(axis=1, skipna=True)
+    aligned["Available sensors"] = aligned[columns].notna().sum(axis=1)
+    return aligned[aligned["Available sensors"] > 0]
+
+
+def environment_coverage(full_frame, segmented_frame, role, boundary):
+    return {
+        "Role": role,
+        "Total readings": len(full_frame),
+        "Retained readings": len(segmented_frame),
+        "Excluded outside phase": max(len(full_frame) - len(segmented_frame), 0),
+        "Phase boundary": boundary,
+    }
 
 
 def duration_hours(frame):
@@ -253,12 +299,16 @@ transfer_time = derive_transfer_time(meat_results)
 environment_results = {}
 environment_full = {}
 environment_warnings = []
+environment_coverage_rows = []
 for item in environment_inputs:
     try:
         prepared = pit.prepare(item["df"], item["time"], item["column"])
         segmented = segment_environment(prepared, item["role"], transfer_time)
         label = f"{item['role']} — {item['column']}"
         environment_full[label] = prepared
+        environment_coverage_rows.append(
+            environment_coverage(prepared, segmented, item["role"], transfer_time)
+        )
         if segmented.empty:
             environment_warnings.append(
                 f"{label}: no readings overlap the applicable Cook/Hold phase."
@@ -294,6 +344,56 @@ for label, item in meat_results.items():
 st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 combined = pd.concat(frames, ignore_index=True)
 st.plotly_chart(px.line(combined, x="Timestamp", y="Temperature °C", color="Profile", title="Brisket - Point and Brisket - Flat"), use_container_width=True, key="brisket_comparison")
+
+# Gap 1: explicit phase segmentation.
+if environment_coverage_rows:
+    st.header("Environment phase segmentation")
+    st.caption(
+        "Cook Environment readings are retained only before transfer. "
+        "Hold Environment readings are retained only from transfer onwards."
+    )
+    st.dataframe(pd.DataFrame(environment_coverage_rows), hide_index=True, use_container_width=True)
+
+# Gap 2: phase-aware alignment and aggregation.
+if environment_results:
+    reference = pd.concat(
+        [item["valid"][["timestamp"]] for item in meat_results.values()],
+        ignore_index=True,
+    ).drop_duplicates().sort_values("timestamp")
+    cook_streams = {k: v for k, v in environment_results.items() if v.role in {COOK_PID, COOK_GRATE}}
+    hold_streams = {k: v for k, v in environment_results.items() if v.role == HOLD_ENV}
+    cook_aggregate = align_environment_to_reference(reference, cook_streams, phase_end=transfer_time)
+    hold_aggregate = align_environment_to_reference(reference, hold_streams, phase_start=transfer_time)
+
+    st.header("Phase-aware environment aggregate")
+    aggregate_rows = []
+    aggregate_frames = []
+    for phase, frame in (("Cook", cook_aggregate), ("Hold", hold_aggregate)):
+        if frame.empty:
+            continue
+        aggregate_rows.append({
+            "Phase": phase,
+            "Start": frame["timestamp"].min(),
+            "End": frame["timestamp"].max(),
+            "Aligned readings": len(frame),
+            "Average environment °C": round(frame["Environment aggregate °C"].mean(), 1),
+            "Average available sensors": round(frame["Available sensors"].mean(), 2),
+        })
+        view = frame[["timestamp", "Environment aggregate °C"]].copy()
+        view["Phase"] = f"{phase} Environment aggregate"
+        aggregate_frames.append(view)
+    if aggregate_rows:
+        st.dataframe(pd.DataFrame(aggregate_rows), hide_index=True, use_container_width=True)
+        combined_environment = pd.concat(aggregate_frames, ignore_index=True)
+        st.plotly_chart(
+            px.line(
+                combined_environment, x="timestamp", y="Environment aggregate °C",
+                color="Phase", title="Phase-aware aggregate environment temperature",
+            ),
+            use_container_width=True, key="phase_environment_aggregate",
+        )
+    else:
+        st.info("No environment readings could be aligned within their applicable phases.")
 
 # Environment analysis including Hold Environment.
 if environment_results:
