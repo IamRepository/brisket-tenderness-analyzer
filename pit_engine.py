@@ -9,11 +9,11 @@ import brisket_engine as meat
 
 
 ROLES = [
-    "🥩 Point",
-    "🥩 Flat",
-    "🍖 Other Meat",
-    "🌡 Grate",
-    "🔥 PID",
+    "🥩 Brisket - Point",
+    "🥩 Brisket - Flat",
+    "🔥 Cook Environment - PID",
+    "🌡 Cook Environment - Grate",
+    "♨ Hold Environment - Probe",
     "🚫 Ignore",
 ]
 
@@ -30,12 +30,16 @@ class PitResult:
     lid_events: pd.DataFrame
 
 
-def classify_columns(df, timestamp_col):
+def classify_columns(df: pd.DataFrame, timestamp_col: str) -> pd.DataFrame:
+    """Suggest a role for each usable temperature column.
 
+    The suggestions are intentionally conservative. Probe 1 and Probe 2 do not
+    reliably identify Point or Flat, so generic meat-probe columns default to
+    Brisket - Flat and must be reviewed by the user.
+    """
     rows = []
 
     for col in df.columns:
-
         if col == timestamp_col:
             continue
 
@@ -45,44 +49,61 @@ def classify_columns(df, timestamp_col):
         if len(valid) < 2:
             continue
 
-        name = str(col).lower()
+        name = str(col).strip().lower()
 
-        if any(
-            x in name
-            for x in (
+        if "point" in name:
+            role = "🥩 Brisket - Point"
+            confidence = 95
+
+        elif "flat" in name:
+            role = "🥩 Brisket - Flat"
+            confidence = 95
+
+        elif any(
+            hint in name
+            for hint in (
+                "hold environment",
+                "hold probe",
+                "holding probe",
+                "holding oven",
+                "oven probe",
+                "hold oven",
+                "cvap",
+                "holding cabinet",
+            )
+        ):
+            role = "♨ Hold Environment - Probe"
+            confidence = 94
+
+        elif any(
+            hint in name
+            for hint in (
                 "grate",
                 "ambient",
                 "pit probe",
                 "chamber probe",
             )
         ):
-            role = "🌡 Grate"
+            role = "🌡 Cook Environment - Grate"
             confidence = 93
 
         elif any(
-            x in name
-            for x in (
+            hint in name
+            for hint in (
+                "cavity temperature",
                 "controller",
                 "smoker",
                 "smoque",
-                "built-in",
-                "oven",
+                "built-in pit",
+                "pid",
             )
         ):
-            role = "🔥 PID"
-            confidence = 90
-
-        elif "point" in name:
-            role = "🥩 Point"
-            confidence = 95
-
-        elif "flat" in name:
-            role = "🥩 Flat"
-            confidence = 95
+            role = "🔥 Cook Environment - PID"
+            confidence = 92
 
         elif any(
-            x in name
-            for x in (
+            hint in name
+            for hint in (
                 "meat",
                 "internal",
                 "food",
@@ -90,37 +111,35 @@ def classify_columns(df, timestamp_col):
                 "probe",
             )
         ):
-            role = "🍖 Other Meat"
-            confidence = 88
+            # A generic probe name cannot reliably indicate Point versus Flat.
+            # Use Flat as a neutral default and require user review.
+            role = "🥩 Brisket - Flat"
+            confidence = 65
 
         else:
-
+            window = min(21, max(3, len(valid) // 50))
             smooth = valid.rolling(
-                min(21, max(3, len(valid) // 50)),
+                window,
                 center=True,
                 min_periods=1,
             ).median()
 
+            start_window = max(2, len(smooth) // 20)
             rise = float(
                 smooth.max()
-                - smooth.iloc[: max(2, len(smooth) // 20)].median()
+                - smooth.iloc[:start_window].median()
             )
-
-            fluct = float(
-                valid.diff().abs().median()
-            )
+            fluctuation = float(valid.diff().abs().median())
 
             if rise >= 20:
-                role = "🍖 Other Meat"
-                confidence = 72
-
-            elif fluct >= 0.5:
-                role = "🌡 Grate"
-                confidence = 65
-
-            else:
-                role = "🔥 PID"
+                role = "🥩 Brisket - Flat"
+                confidence = 55
+            elif fluctuation >= 0.5:
+                role = "🌡 Cook Environment - Grate"
                 confidence = 60
+            else:
+                role = "🔥 Cook Environment - PID"
+                confidence = 55
 
         rows.append(
             {
@@ -133,84 +152,98 @@ def classify_columns(df, timestamp_col):
     return pd.DataFrame(rows)
 
 
-def prepare(df, timestamp_col, temp_col):
-
-    out = pd.DataFrame(
+def prepare(
+    df: pd.DataFrame,
+    timestamp_col: str,
+    temp_col: str,
+) -> pd.DataFrame:
+    """Prepare and validate one environmental temperature stream."""
+    prepared = pd.DataFrame(
         {
             "timestamp": meat.parse_ts(df[timestamp_col]),
             "temperature_c": meat.parse_temp(df[temp_col]),
         }
     ).dropna()
 
-    out = out[
-        out.temperature_c.between(-20, 400)
+    prepared = prepared[
+        prepared["temperature_c"].between(-20, 400)
     ]
 
     return (
-        out.sort_values("timestamp")
+        prepared.sort_values("timestamp")
         .drop_duplicates("timestamp", keep="last")
         .reset_index(drop=True)
     )
 
 
-def analyse(prepared, role):
+def analyse(prepared: pd.DataFrame, role: str) -> PitResult:
+    """Calculate descriptive statistics for an environmental profile."""
+    if prepared.empty:
+        raise ValueError("The selected environmental profile contains no valid data.")
 
-    values = prepared.temperature_c.astype(float)
+    values = prepared["temperature_c"].astype(float)
+    stddev = float(values.std(ddof=0))
+    median_change = (
+        float(values.diff().abs().median())
+        if len(values) > 1
+        else 0.0
+    )
 
-    std = float(values.std(ddof=0))
-
-    change = float(
-        values.diff().abs().median()
-    ) if len(values) > 1 else 0.0
-
-    score = float(
+    stability_score = float(
         np.clip(
-            100 - 4 * std - 8 * change,
+            100 - 4 * stddev - 8 * median_change,
             0,
             100,
         )
     )
 
-    events = pd.DataFrame()
+    lid_events = pd.DataFrame()
 
-    if role == "🌡 Grate" and len(prepared) > 4:
-
-        diffs = values.diff(5)
+    if role == "🌡 Cook Environment - Grate" and len(prepared) > 4:
+        differences = values.diff(5)
+        event_mask = differences <= -12
 
         candidates = prepared.loc[
-            diffs <= -12,
+            event_mask,
             ["timestamp", "temperature_c"],
         ].copy()
 
-        candidates["Drop °C"] = (
-            -diffs[diffs <= -12]
-        ).round(1).values
+        if not candidates.empty:
+            candidates["Drop °C"] = (
+                -differences.loc[event_mask]
+            ).round(1).to_numpy()
 
-        events = candidates.rename(
-            columns={
-                "timestamp": "Detected time",
-                "temperature_c": "Temperature °C",
-            }
-        ).head(20)
+            lid_events = candidates.rename(
+                columns={
+                    "timestamp": "Detected time",
+                    "temperature_c": "Temperature °C",
+                }
+            ).head(20)
 
     return PitResult(
-        role,
-        prepared,
-        float(values.mean()),
-        float(values.min()),
-        float(values.max()),
-        std,
-        score,
-        events,
+        role=role,
+        timeline=prepared,
+        average=float(values.mean()),
+        minimum=float(values.min()),
+        maximum=float(values.max()),
+        stddev=stddev,
+        stability_score=stability_score,
+        lid_events=lid_events,
     )
 
 
-def align(meat_timeline, pit_results):
+def align(
+    meat_timeline: pd.DataFrame,
+    environment_results: dict[str, PitResult],
+) -> pd.DataFrame:
+    """Align environmental profiles to one meat timeline for comparison.
 
+    Alignment uses nearest timestamps with a tolerance based on each
+    environment stream's median sampling interval. The function preserves
+    missing periods rather than interpolating across smoker-to-hold transfers.
+    """
     overlay = (
-        meat_timeline[
-            ["Timestamp", "Temperature °C"]
-        ]
+        meat_timeline[["Timestamp", "Temperature °C"]]
         .rename(
             columns={
                 "Timestamp": "timestamp",
@@ -220,40 +253,33 @@ def align(meat_timeline, pit_results):
         .sort_values("timestamp")
     )
 
-    for label, result in pit_results.items():
-
+    for label, result in environment_results.items():
         stream = (
             result.timeline
-            .rename(
-                columns={
-                    "temperature_c": label
-                }
-            )
+            .rename(columns={"temperature_c": label})
             .sort_values("timestamp")
         )
 
         intervals = (
-            stream.timestamp
+            stream["timestamp"]
             .diff()
             .dt.total_seconds()
             .dropna()
         )
+        intervals = intervals[intervals > 0]
 
-        tolerance = max(
-            float(intervals.median()) * 2
-            if len(intervals)
-            else 60,
-            60,
+        tolerance_seconds = (
+            max(float(intervals.median()) * 2, 60.0)
+            if not intervals.empty
+            else 60.0
         )
 
         overlay = pd.merge_asof(
-            overlay,
+            overlay.sort_values("timestamp"),
             stream[["timestamp", label]],
             on="timestamp",
             direction="nearest",
-            tolerance=pd.Timedelta(
-                seconds=tolerance
-            ),
+            tolerance=pd.Timedelta(seconds=tolerance_seconds),
         )
 
     return overlay
