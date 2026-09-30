@@ -10,7 +10,7 @@ import streamlit as st
 import brisket_engine as engine
 import pit_engine as pit
 
-APP_VERSION = "2.6.1"
+APP_VERSION = "2.6.2"
 POINT = "🥩 Brisket - Point"
 FLAT = "🥩 Brisket - Flat"
 COOK_PID = "🔥 Cook Environment - PID"
@@ -99,16 +99,26 @@ def phase_stats(valid, detection):
 
 
 def derive_transfer_time(meat_results):
-    """Use the median detected pull time across meat probes as the transfer boundary."""
-    pulls = [
+    """Return the median detected pull time without epoch or precision conversion.
+
+    For an even number of pull times, the boundary is the exact midpoint between
+    the two central timestamps. For an odd number, it is the central timestamp.
+    """
+    pulls = sorted(
         pd.Timestamp(item["result"].detection.pull_timestamp)
         for item in meat_results.values()
         if item["result"].detection.pull_timestamp is not None
-    ]
+    )
     if not pulls:
         return None
-    values = pd.Series(pulls).sort_values().astype("int64")
-    return pd.Timestamp(int(values.median()))
+
+    middle = len(pulls) // 2
+    if len(pulls) % 2 == 1:
+        return pulls[middle]
+
+    lower = pulls[middle - 1]
+    upper = pulls[middle]
+    return lower + (upper - lower) / 2
 
 
 def segment_environment(prepared, role, transfer_time):
@@ -238,6 +248,7 @@ if not meat_results:
 transfer_time = derive_transfer_time(meat_results)
 environment_results = {}
 environment_full = {}
+environment_warnings = []
 for item in environment_inputs:
     try:
         prepared = pit.prepare(item["df"], item["time"], item["column"])
@@ -245,13 +256,17 @@ for item in environment_inputs:
         label = f"{item['role']} — {item['column']}"
         environment_full[label] = prepared
         if segmented.empty:
-            errors.append(f"{label}: no readings overlap the applicable Cook/Hold phase.")
+            environment_warnings.append(
+                f"{label}: no readings overlap the applicable Cook/Hold phase."
+            )
             continue
         environment_results[label] = pit.analyse(segmented, item["role"])
     except Exception as exc:
-        errors.append(f"{item['file']} / {item['column']}: {exc}")
-for error in errors:
-    st.warning(error)
+        environment_warnings.append(
+            f"{item['file']} / {item['column']}: {exc}"
+        )
+for warning in environment_warnings:
+    st.warning(warning)
 
 # Session summary
 st.header("Session detection summary")
