@@ -36,6 +36,14 @@ def _text(value):
     return text.strip()
 
 
+def _short_label(value):
+    """Return a concise label; source is displayed in a dedicated column."""
+    text = _text(value)
+    if " — " in text:
+        text = text.split(" — ", 1)[0]
+    return text.strip()
+
+
 def _table(data, widths=None, header=True, font_size=7.5):
     wrapped = [[Paragraph(_text(cell), STYLES["Cell"]) for cell in row] for row in data]
     table = Table(wrapped, colWidths=widths, repeatRows=1 if header else 0, hAlign="LEFT")
@@ -85,7 +93,7 @@ def _chart(series, title, y_title="Temperature (C)"):
         points = [(float(x), float(y)) for x, y in zip(hours, values) if pd.notna(y)]
         if points:
             chart_data.append(points)
-            names.append(_text(name))
+            names.append(_short_label(name))
             all_times.extend(x for x, _ in points)
             all_values.extend(y for _, y in points)
 
@@ -138,8 +146,9 @@ STYLES.add(ParagraphStyle(name="Small", parent=STYLES["BodyText"], fontSize=7.5,
 STYLES.add(ParagraphStyle(name="Centre", parent=STYLES["BodyText"], alignment=TA_CENTER))
 
 
-def build_pdf_report(app_version, configuration, meat_results, stats, environment_results, transfer_time):
+def build_pdf_report(app_version, configuration, meat_results, stats, environment_results, transfer_time, environment_sources=None):
     """Return a complete analysis report as PDF bytes."""
+    environment_sources = environment_sources or {}
     buffer = BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -167,19 +176,19 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
     story.append(_table([["Derived smoker-to-hold boundary", boundary]], [80 * mm, 150 * mm], header=False))
 
     story.append(Paragraph("Session detection summary", STYLES["Section"]))
-    rows = [["Profile", "Session", "Confidence", "Pull", "Peak C", "Average C", "Minimum C", "Cook h", "Hold h", "Average cook C", "Average hold C", "Sampling", "Gap threshold"]]
+    rows = [["Profile", "Source", "Session", "Confidence", "Pull", "Peak C", "Average C", "Minimum C", "Cook h", "Hold h", "Average cook C", "Average hold C", "Sampling", "Gap threshold"]]
     for label, item in meat_results.items():
         result = item["result"]
         stat = stats[label]
         sample = item["sample"]
         rows.append([
-            label, result.detection.session_type, f"{result.detection.confidence}%", _text(result.detection.pull_timestamp),
+            _short_label(label), item["source"], result.detection.session_type, f"{result.detection.confidence}%", _text(result.detection.pull_timestamp),
             f"{result.detection.peak_temperature:.1f}", f"{result.detection.average_temperature:.1f}", f"{result.detection.minimum_temperature:.1f}",
             f"{stat['cook_h']:.2f}", f"{stat['hold_h']:.2f}", _text(None if stat['cook_avg'] is None else round(stat['cook_avg'], 1)),
             _text(None if stat['hold_avg'] is None else round(stat['hold_avg'], 1)),
             _interval(sample['normal']), _interval(sample['threshold']),
         ])
-    story.append(_table(rows, [40*mm, 22*mm, 15*mm, 30*mm, 13*mm, 15*mm, 15*mm, 13*mm, 13*mm, 18*mm, 18*mm, 17*mm, 17*mm], font_size=6.5))
+    story.append(_table(rows, [31*mm, 33*mm, 18*mm, 14*mm, 29*mm, 12*mm, 13*mm, 13*mm, 11*mm, 11*mm, 17*mm, 17*mm, 17*mm, 18*mm], font_size=6.2))
 
     story.append(PageBreak())
     story.append(Paragraph("Brisket probe comparison", STYLES["Section"]))
@@ -187,8 +196,8 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
     meat_series = []
     for label, item in meat_results.items():
         result = item["result"]
-        comparison.append([label, item["source"], f"{result.cook:.1%}", f"{result.hold:.1%}", f"{result.total:.1%}", result.assessment if result.complete else "Partial session", f"{result.analysed_hours:.2f}"])
-        meat_series.append((label, item["valid"], "timestamp", "temperature_c"))
+        comparison.append([_short_label(label), item["source"], f"{result.cook:.1%}", f"{result.hold:.1%}", f"{result.total:.1%}", result.assessment if result.complete else "Partial session", f"{result.analysed_hours:.2f}"])
+        meat_series.append((_short_label(label), item["valid"], "timestamp", "temperature_c"))
     story.append(_table(comparison, [52*mm, 45*mm, 27*mm, 27*mm, 24*mm, 65*mm, 22*mm]))
     story.append(Spacer(1, 4 * mm))
     story.append(_chart(meat_series, "Brisket Point and Flat temperature profiles"))
@@ -196,13 +205,13 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
     story.append(PageBreak())
     story.append(Paragraph("Environment analysis", STYLES["Section"]))
     if environment_results:
-        env_rows = [["Environment stream", "Role", "Start", "End", "Duration h", "Average C", "Minimum C", "Maximum C", "Stability"]]
+        env_rows = [["Environment stream", "Source", "Role", "Start", "End", "Duration h", "Average C", "Minimum C", "Maximum C", "Stability"]]
         env_series = []
         for label, result in environment_results.items():
             frame = result.timeline
-            env_rows.append([label, result.role, _text(frame['timestamp'].min()), _text(frame['timestamp'].max()), f"{_duration(frame):.2f}", f"{result.average:.1f}", f"{result.minimum:.1f}", f"{result.maximum:.1f}", f"{result.stability_score:.0f}/100"])
-            env_series.append((label, frame, "timestamp", "temperature_c"))
-        story.append(_table(env_rows, [55*mm, 43*mm, 30*mm, 30*mm, 18*mm, 18*mm, 18*mm, 18*mm, 18*mm], font_size=6.8))
+            env_rows.append([_short_label(label), environment_sources.get(label, "N/A"), _short_label(result.role), _text(frame['timestamp'].min()), _text(frame['timestamp'].max()), f"{_duration(frame):.2f}", f"{result.average:.1f}", f"{result.minimum:.1f}", f"{result.maximum:.1f}", f"{result.stability_score:.0f}/100"])
+            env_series.append((_short_label(label), frame, "timestamp", "temperature_c"))
+        story.append(_table(env_rows, [40*mm, 38*mm, 35*mm, 27*mm, 27*mm, 17*mm, 17*mm, 17*mm, 17*mm, 18*mm], font_size=6.5))
         story.append(Spacer(1, 4 * mm))
         story.append(_chart(env_series, "Cook and Hold Environment profiles"))
     else:
@@ -211,7 +220,8 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
     for label, item in meat_results.items():
         result = item["result"]
         story.append(PageBreak())
-        story.append(Paragraph(label, STYLES["Section"]))
+        story.append(Paragraph(_short_label(label), STYLES["Section"]))
+        story.append(Paragraph(f"Source: {_text(item['source'])}", STYLES["Small"]))
         stat = stats[label]
         metrics = [
             ["Metric", "Value", "Metric", "Value"],
@@ -225,7 +235,7 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
         ]
         story.append(_table(metrics, [45*mm, 85*mm, 45*mm, 85*mm]))
         story.append(Spacer(1, 3 * mm))
-        story.append(_chart([(label, item["valid"], "timestamp", "temperature_c")], f"Temperature profile - {label}"))
+        story.append(_chart([(_short_label(label), item["valid"], "timestamp", "temperature_c")], f"Temperature profile - {_short_label(label)}"))
         bands = result.summary[result.summary["Duration hours"] > 0].copy()
         if not bands.empty:
             story.append(Paragraph("Rendering band calculation", STYLES["Subsection"]))

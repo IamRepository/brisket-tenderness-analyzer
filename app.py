@@ -11,7 +11,7 @@ import brisket_engine as engine
 import pit_engine as pit
 from pdf_report import build_pdf_report
 
-APP_VERSION = "2.6.4"
+APP_VERSION = "2.6.5"
 POINT = "🥩 Brisket - Point"
 FLAT = "🥩 Brisket - Flat"
 COOK_PID = "🔥 Cook Environment - PID"
@@ -297,6 +297,7 @@ if not meat_results:
 
 transfer_time = derive_transfer_time(meat_results)
 environment_results = {}
+environment_sources = {}
 environment_full = {}
 environment_warnings = []
 environment_coverage_rows = []
@@ -315,6 +316,7 @@ for item in environment_inputs:
             )
             continue
         environment_results[label] = pit.analyse(segmented, item["role"])
+        environment_sources[label] = f"{item['file']} / {item['column']}"
     except Exception as exc:
         environment_warnings.append(
             f"{item['file']} / {item['column']}: {exc}"
@@ -466,6 +468,7 @@ pdf_bytes = build_pdf_report(
     meat_results=meat_results,
     stats=stats,
     environment_results=environment_results,
+    environment_sources=environment_sources,
     transfer_time=transfer_time,
 )
 report_slot.download_button(
