@@ -9,8 +9,9 @@ import streamlit as st
 
 import brisket_engine as engine
 import pit_engine as pit
+from pdf_report import build_pdf_report
 
-APP_VERSION = "2.6.2"
+APP_VERSION = "2.6.3"
 POINT = "🥩 Brisket - Point"
 FLAT = "🥩 Brisket - Flat"
 COOK_PID = "🔥 Cook Environment - PID"
@@ -31,6 +32,9 @@ with st.sidebar:
         manual_gap = None
         if override_gap:
             manual_gap = st.number_input("Maximum accepted gap (seconds)", 1.0, 86400.0, 10.0, 1.0)
+    st.divider()
+    report_slot = st.empty()
+    report_slot.caption("Run an analysis to enable the full PDF report.")
 
 source = st.segmented_control("Data source", ["Upload file", "Try reference brisket"], default="Upload file")
 
@@ -355,5 +359,21 @@ for index, (label, item) in enumerate(meat_results.items()):
         with tabs[3]:
             cols = st.columns(3); cols[0].metric("Analysed hours", f"{result.analysed_hours:.3f}"); cols[1].metric("Excluded gap hours", f"{result.excluded_gap_hours:.3f}"); cols[2].metric("Below 60°C hours", f"{result.below_model_hours:.3f}")
             st.write(f"Sampling: {sample['mode']} | Normal interval: {interval_text(sample['normal'])} | Gap threshold: {interval_text(sample['threshold'])}")
+
+pdf_bytes = build_pdf_report(
+    app_version=APP_VERSION,
+    configuration=config,
+    meat_results=meat_results,
+    stats=stats,
+    environment_results=environment_results,
+    transfer_time=transfer_time,
+)
+report_slot.download_button(
+    "Download full PDF report",
+    data=pdf_bytes,
+    file_name="brisket_session_analysis_full_report.pdf",
+    mime="application/pdf",
+    use_container_width=True,
+)
 
 st.caption("Cook Environment streams are evaluated before the derived transfer boundary. Hold Environment streams are evaluated after it. No environmental values are interpolated across the smoker-to-hold transfer.")
