@@ -79,8 +79,9 @@ def _footer(canvas,doc):canvas.saveState();canvas.setFont('Helvetica',7);canvas.
 def _interval(x):return 'Unknown' if x is None else (f'{x:.0f} sec' if x<60 else (f'{x/60:.1f} min' if x<3600 else f'{x/3600:.2f} h'))
 def _duration(f):return 0 if f is None or len(f)<2 else (f.timestamp.iloc[-1]-f.timestamp.iloc[0]).total_seconds()/3600
 
-def build_pdf_report(app_version,configuration,meat_results,stats,environment_results,transfer_time,environment_sources=None,master_start=None,cook_aggregate=None,hold_aggregate=None):
+def build_pdf_report(app_version,configuration,meat_results,stats,environment_results,transfer_time,environment_sources=None,master_start=None,cook_aggregate=None,hold_aggregate=None,environment_integrity=None,balance=None):
     environment_sources=environment_sources or {}
+    environment_integrity=environment_integrity or []
     if master_start is None:
         starts=[x['valid'].timestamp.min() for x in meat_results.values() if not x['valid'].empty]+[r.timeline.timestamp.min() for r in environment_results.values() if not r.timeline.empty];master_start=min(starts) if starts else None
     out=BytesIO();doc=SimpleDocTemplate(out,pagesize=A4,leftMargin=14*mm,rightMargin=14*mm,topMargin=13*mm,bottomMargin=15*mm);s=[]
@@ -91,6 +92,13 @@ def build_pdf_report(app_version,configuration,meat_results,stats,environment_re
     for label,item in meat_results.items():
         r=item['result'];st=stats[label];sa=item['sample'];name=_stage(label,r);timing.append([name,_source(item['source']),r.detection.session_type,f'{r.detection.confidence}%',_text(r.detection.pull_timestamp),f"{st['cook_h']:.2f}",f"{st['hold_h']:.2f}"]);temps.append([name,_temp(r.detection.peak_temperature),_temp(r.detection.average_temperature),_temp(r.detection.minimum_temperature),_temp(st['cook_avg']),_temp(st['hold_avg']),_interval(sa['normal']),_interval(sa['threshold'])]);comp.append([name,_source(item['source']),f'{r.cook:.1%}',f'{r.hold:.1%}',f'{r.total:.1%}',r.assessment if r.complete else 'Partial session',f'{r.analysed_hours:.2f}']);meat_series.append((name,item['valid'],'timestamp','temperature_c'))
     s += [PageBreak(),Paragraph('Session detection and timing',STYLES['Section']),_table(timing,[42*mm,31*mm,28*mm,14*mm,32*mm,16*mm,16*mm],6.8),Spacer(1,5*mm),Paragraph('Temperature and sampling summary',STYLES['Section']),_table(temps,[48*mm,17*mm,17*mm,17*mm,22*mm,22*mm,21*mm,21*mm],6.8),PageBreak(),Paragraph('Brisket probe comparison',STYLES['Section']),_table(comp,[43*mm,31*mm,17*mm,17*mm,17*mm,42*mm,14*mm],6.8),PageBreak(),Paragraph('Brisket temperature profiles',STYLES['Section']),_chart(meat_series,'Brisket Point and Flat temperature profiles',master_start,transfer_time),PageBreak(),Paragraph('Environment analysis',STYLES['Section'])]
+    if environment_integrity:
+        integrity_rows = [["Environment role", "Status", "Streams"]]
+        integrity_rows += [[x.get("Environment role"), x.get("Status"), x.get("Streams")] for x in environment_integrity]
+        s += [Paragraph("Environment integrity", STYLES["Section"]), _table(integrity_rows, [92*mm, 48*mm, 40*mm])]
+    if balance:
+        balance_rows = [["Metric", "Value"], ["Point peak", f"{balance['Point peak °C']:.1f} C"], ["Flat peak", f"{balance['Flat peak °C']:.1f} C"], ["Peak difference", f"{balance['Peak difference °C']:.1f} C"], ["Cook contribution difference", f"{balance['Cook contribution difference']:.1%}"], ["Hold contribution difference", f"{balance['Hold contribution difference']:.1%}"], ["Balance assessment", balance["Assessment"]]]
+        s += [Spacer(1, 4*mm), Paragraph("Brisket balance", STYLES["Section"]), _table(balance_rows, [86*mm, 94*mm])]
     if environment_results:
         er=[['Stream','Source','Stage','Start','End','h','Avg C','Min C','Max C','Stab.']];es=[]
         for label,r in environment_results.items():

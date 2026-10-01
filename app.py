@@ -10,7 +10,7 @@ import brisket_engine as engine
 import pit_engine as pit
 from pdf_report import build_pdf_report
 
-APP_VERSION = "2.6.9"
+APP_VERSION = "2.7.0"
 POINT = pit.POINT
 FLAT = pit.FLAT
 COOK_PID = pit.COOK_PID
@@ -158,6 +158,100 @@ def duration_hours(frame):
     return max((frame["timestamp"].iloc[-1] - frame["timestamp"].iloc[0]).total_seconds() / 3600, 0.0)
 
 
+def environment_integrity_rows(environment_results):
+    """Summarise whether the expected environment roles are available."""
+    rows = []
+    for role in (COOK_PID, COOK_GRATE, HOLD_ENV):
+        matches = [label for label, result in environment_results.items() if result.role == role]
+        rows.append({
+            "Environment role": role,
+            "Status": "Present" if matches else "Missing",
+            "Streams": len(matches),
+        })
+    return rows
+
+
+def build_composite_environment(environment_results):
+    """Build stage curves without blending Cook and Hold or bridging transfer gaps.
+
+    Cook Grate is preferred over Cook PID. If Cook Grate is unavailable, Cook
+    PID is used. Multiple Hold Environment streams are aligned and averaged only
+    where readings overlap within timestamp tolerance.
+    """
+    cook_grate = [(k, v) for k, v in environment_results.items() if v.role == COOK_GRATE]
+    cook_pid = [(k, v) for k, v in environment_results.items() if v.role == COOK_PID]
+    hold = [(k, v) for k, v in environment_results.items() if v.role == HOLD_ENV]
+
+    def one_stream(candidates, phase):
+        if not candidates:
+            return pd.DataFrame()
+        frame = candidates[0][1].timeline[["timestamp", "temperature_c"]].copy()
+        frame.rename(columns={"temperature_c": "Environment aggregate °C"}, inplace=True)
+        frame["Available sensors"] = 1
+        frame["Phase"] = phase
+        return frame
+
+    cook = one_stream(cook_grate or cook_pid, "Cook")
+
+    if not hold:
+        hold_frame = pd.DataFrame()
+    elif len(hold) == 1:
+        hold_frame = one_stream(hold, "Hold")
+    else:
+        renamed = []
+        for index, (_, result) in enumerate(hold):
+            frame = result.timeline[["timestamp", "temperature_c"]].copy()
+            frame.rename(columns={"temperature_c": f"sensor_{index}"}, inplace=True)
+            renamed.append(frame.set_index("timestamp"))
+        joined = pd.concat(renamed, axis=1).sort_index()
+        hold_frame = joined.mean(axis=1, skipna=True).rename("Environment aggregate °C").to_frame()
+        hold_frame["Available sensors"] = joined.notna().sum(axis=1)
+        hold_frame["Phase"] = "Hold"
+        hold_frame.reset_index(inplace=True)
+
+    return cook, hold_frame
+
+
+def brisket_balance(meat_results):
+    """Compare full-session Point and Flat profiles using bounded raw metrics."""
+    point = None
+    flat = None
+    for label, item in meat_results.items():
+        result = item["result"]
+        if result.detection.session_type != "Cook + Hold":
+            continue
+        role = str(label).split(" — ", 1)[0]
+        if "Point" in role and point is None:
+            point = result
+        elif "Flat" in role and flat is None:
+            flat = result
+
+    if point is None or flat is None:
+        return None
+
+    peak_delta = abs(point.detection.peak_temperature - flat.detection.peak_temperature)
+    cook_delta = abs(point.cook - flat.cook)
+    hold_delta = abs(point.hold - flat.hold)
+
+    if peak_delta < 5:
+        assessment = "Excellent thermal balance"
+    elif peak_delta < 10:
+        assessment = "Good thermal balance"
+    elif peak_delta < 15:
+        assessment = "Uneven thermal development"
+    else:
+        assessment = "Large Point-Flat temperature difference"
+
+    return {
+        "Point peak °C": round(point.detection.peak_temperature, 1),
+        "Flat peak °C": round(flat.detection.peak_temperature, 1),
+        "Peak difference °C": round(peak_delta, 1),
+        "Cook contribution difference": cook_delta,
+        "Hold contribution difference": hold_delta,
+        "Assessment": assessment,
+    }
+
+
 # Step 1
 st.header("Step 1: Upload temperature files")
 if source == "Try reference brisket":
@@ -274,11 +368,21 @@ for label, item in meat_results.items():
 st.dataframe(pd.DataFrame(summary), hide_index=True, use_container_width=True)
 
 st.header("Environment integrity")
-integrity = []
-for role in (COOK_PID, COOK_GRATE, HOLD_ENV):
-    matching = [label for label, result in environment_results.items() if result.role == role]
-    integrity.append({"Environment role": role, "Status": "Present" if matching else "Missing", "Streams": len(matching)})
+integrity = environment_integrity_rows(environment_results)
 st.dataframe(pd.DataFrame(integrity), hide_index=True, use_container_width=True)
+
+balance = brisket_balance(meat_results)
+if balance is not None:
+    st.header("Brisket balance")
+    balance_view = pd.DataFrame([
+        {"Metric": "Point peak", "Value": f"{balance['Point peak °C']:.1f}°C"},
+        {"Metric": "Flat peak", "Value": f"{balance['Flat peak °C']:.1f}°C"},
+        {"Metric": "Peak difference", "Value": f"{balance['Peak difference °C']:.1f}°C"},
+        {"Metric": "Cook contribution difference", "Value": f"{balance['Cook contribution difference']:.1%}"},
+        {"Metric": "Hold contribution difference", "Value": f"{balance['Hold contribution difference']:.1%}"},
+        {"Metric": "Balance assessment", "Value": balance["Assessment"]},
+    ])
+    st.dataframe(balance_view, hide_index=True, use_container_width=True)
 
 st.header("Brisket probe comparison")
 rows, frames = [], []
@@ -325,6 +429,20 @@ for index, (label, item) in enumerate(meat_results.items()):
         detail = add_transfer_marker(detail, transfer_time, master_start)
         st.plotly_chart(detail, use_container_width=True, key=f"temperature_{index}")
 
-pdf_bytes = build_pdf_report(app_version=APP_VERSION, configuration=config, meat_results=meat_results, stats=stats, environment_results=environment_results, environment_sources=environment_sources, transfer_time=transfer_time, master_start=master_start)
+cook_aggregate, hold_aggregate = build_composite_environment(environment_results)
+pdf_bytes = build_pdf_report(
+    app_version=APP_VERSION,
+    configuration=config,
+    meat_results=meat_results,
+    stats=stats,
+    environment_results=environment_results,
+    environment_sources=environment_sources,
+    transfer_time=transfer_time,
+    master_start=master_start,
+    cook_aggregate=cook_aggregate,
+    hold_aggregate=hold_aggregate,
+    environment_integrity=integrity,
+    balance=balance,
+)
 report_slot.download_button("Download full PDF report", data=pdf_bytes, file_name="brisket_session_analysis_full_report.pdf", mime="application/pdf", use_container_width=True)
 st.caption("All charts use one master session timeline. Cook Environment streams are evaluated before the transfer boundary, Hold Environment streams after it, and missing values are not interpolated across transfer.")
