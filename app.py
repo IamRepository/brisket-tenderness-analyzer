@@ -11,7 +11,7 @@ import brisket_engine as engine
 import pit_engine as pit
 from pdf_report import build_pdf_report
 
-APP_VERSION = "2.6.5"
+APP_VERSION = "2.6.6"
 POINT = "🥩 Brisket - Point"
 FLAT = "🥩 Brisket - Flat"
 COOK_PID = "🔥 Cook Environment - PID"
@@ -201,6 +201,19 @@ def align_hold_delta(hold_frame, meat_frame, label):
     merged["Environment minus meat °C"] = merged["Hold environment °C"] - merged["Meat °C"]
     merged["Profile"] = label
     return merged
+
+
+def derive_master_start(meat_results, environment_results):
+    """Return the earliest timestamp across every analysed stream."""
+    starts = []
+    for item in meat_results.values():
+        valid = item.get("valid")
+        if valid is not None and not valid.empty:
+            starts.append(pd.Timestamp(valid["timestamp"].min()))
+    for result in environment_results.values():
+        if result.timeline is not None and not result.timeline.empty:
+            starts.append(pd.Timestamp(result.timeline["timestamp"].min()))
+    return min(starts) if starts else None
 
 
 # Step 1
@@ -462,6 +475,8 @@ for index, (label, item) in enumerate(meat_results.items()):
             cols = st.columns(3); cols[0].metric("Analysed hours", f"{result.analysed_hours:.3f}"); cols[1].metric("Excluded gap hours", f"{result.excluded_gap_hours:.3f}"); cols[2].metric("Below 60°C hours", f"{result.below_model_hours:.3f}")
             st.write(f"Sampling: {sample['mode']} | Normal interval: {interval_text(sample['normal'])} | Gap threshold: {interval_text(sample['threshold'])}")
 
+master_start = derive_master_start(meat_results, environment_results)
+
 pdf_bytes = build_pdf_report(
     app_version=APP_VERSION,
     configuration=config,
@@ -470,6 +485,7 @@ pdf_bytes = build_pdf_report(
     environment_results=environment_results,
     environment_sources=environment_sources,
     transfer_time=transfer_time,
+    master_start=master_start,
 )
 report_slot.download_button(
     "Download full PDF report",

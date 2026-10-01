@@ -68,7 +68,7 @@ def _table(data, widths=None, header=True, font_size=7.5):
     return table
 
 
-def _chart(series, title, y_title="Temperature (C)"):
+def _chart(series, title, y_title="Temperature (C)", master_start=None):
     drawing = Drawing(250 * mm, 92 * mm)
     chart = LinePlot()
     chart.x = 18 * mm
@@ -87,8 +87,8 @@ def _chart(series, title, y_title="Temperature (C)"):
         if len(clean) > 350:
             step = max(len(clean) // 350, 1)
             clean = clean.iloc[::step]
-        start = clean[time_col].min()
-        hours = (clean[time_col] - start).dt.total_seconds() / 3600.0
+        origin = pd.Timestamp(master_start) if master_start is not None else clean[time_col].min()
+        hours = (clean[time_col] - origin).dt.total_seconds() / 3600.0
         values = pd.to_numeric(clean[value_col], errors="coerce")
         points = [(float(x), float(y)) for x, y in zip(hours, values) if pd.notna(y)]
         if points:
@@ -123,7 +123,7 @@ def _chart(series, title, y_title="Temperature (C)"):
     drawing.add(chart)
     drawing.add(legend)
     drawing.add(String(18 * mm, 80 * mm, _text(title), fontName="Helvetica-Bold", fontSize=11, fillColor=DARK))
-    drawing.add(String(18 * mm, 5 * mm, "Elapsed time from each stream start (hours)", fontSize=7, fillColor=DARK))
+    drawing.add(String(18 * mm, 5 * mm, "Elapsed time from master session start (hours)", fontSize=7, fillColor=DARK))
     drawing.add(String(2 * mm, 42 * mm, y_title, fontSize=7, fillColor=DARK))
     return drawing
 
@@ -146,9 +146,19 @@ STYLES.add(ParagraphStyle(name="Small", parent=STYLES["BodyText"], fontSize=7.5,
 STYLES.add(ParagraphStyle(name="Centre", parent=STYLES["BodyText"], alignment=TA_CENTER))
 
 
-def build_pdf_report(app_version, configuration, meat_results, stats, environment_results, transfer_time, environment_sources=None):
+def build_pdf_report(app_version, configuration, meat_results, stats, environment_results, transfer_time, environment_sources=None, master_start=None):
     """Return a complete analysis report as PDF bytes."""
     environment_sources = environment_sources or {}
+    if master_start is None:
+        starts = []
+        for item in meat_results.values():
+            valid = item.get("valid")
+            if valid is not None and not valid.empty:
+                starts.append(pd.Timestamp(valid["timestamp"].min()))
+        for result in environment_results.values():
+            if result.timeline is not None and not result.timeline.empty:
+                starts.append(pd.Timestamp(result.timeline["timestamp"].min()))
+        master_start = min(starts) if starts else None
     buffer = BytesIO()
     doc = SimpleDocTemplate(
         buffer,
@@ -173,7 +183,7 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
     story.append(_table(conf_data, [95 * mm, 135 * mm]))
     story.append(Spacer(1, 4 * mm))
     boundary = _text(transfer_time) if transfer_time is not None else "Not detected"
-    story.append(_table([["Derived smoker-to-hold boundary", boundary]], [80 * mm, 150 * mm], header=False))
+    story.append(_table([["Master timeline start", _text(master_start)], ["Derived smoker-to-hold boundary", boundary]], [80 * mm, 150 * mm], header=False))
 
     story.append(Paragraph("Session detection summary", STYLES["Section"]))
     rows = [["Profile", "Source", "Session", "Confidence", "Pull", "Peak C", "Average C", "Minimum C", "Cook h", "Hold h", "Average cook C", "Average hold C", "Sampling", "Gap threshold"]]
@@ -200,7 +210,7 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
         meat_series.append((_short_label(label), item["valid"], "timestamp", "temperature_c"))
     story.append(_table(comparison, [52*mm, 45*mm, 27*mm, 27*mm, 24*mm, 65*mm, 22*mm]))
     story.append(Spacer(1, 4 * mm))
-    story.append(_chart(meat_series, "Brisket Point and Flat temperature profiles"))
+    story.append(_chart(meat_series, "Brisket Point and Flat temperature profiles", master_start=master_start))
 
     story.append(PageBreak())
     story.append(Paragraph("Environment analysis", STYLES["Section"]))
@@ -213,7 +223,7 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
             env_series.append((_short_label(label), frame, "timestamp", "temperature_c"))
         story.append(_table(env_rows, [40*mm, 38*mm, 35*mm, 27*mm, 27*mm, 17*mm, 17*mm, 17*mm, 17*mm, 18*mm], font_size=6.5))
         story.append(Spacer(1, 4 * mm))
-        story.append(_chart(env_series, "Cook and Hold Environment profiles"))
+        story.append(_chart(env_series, "Cook and Hold Environment profiles", master_start=master_start))
     else:
         story.append(Paragraph("No environment streams were included in this analysis.", STYLES["BodyText"]))
 
@@ -235,7 +245,7 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
         ]
         story.append(_table(metrics, [45*mm, 85*mm, 45*mm, 85*mm]))
         story.append(Spacer(1, 3 * mm))
-        story.append(_chart([(_short_label(label), item["valid"], "timestamp", "temperature_c")], f"Temperature profile - {_short_label(label)}"))
+        story.append(_chart([(_short_label(label), item["valid"], "timestamp", "temperature_c")], f"Temperature profile - {_short_label(label)}", master_start=master_start))
         bands = result.summary[result.summary["Duration hours"] > 0].copy()
         if not bands.empty:
             story.append(Paragraph("Rendering band calculation", STYLES["Subsection"]))
@@ -246,7 +256,7 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
 
     story.append(PageBreak())
     story.append(Paragraph("Interpretation notes", STYLES["Section"]))
-    story.append(Paragraph("Cook Environment streams are evaluated before the derived transfer boundary. Hold Environment streams are evaluated after it. Missing values are preserved and are not interpolated across the smoker-to-hold transfer. Stability and event indicators are application-defined analytical estimates and are not manufacturer-provided Weber metrics.", STYLES["BodyText"]))
+    story.append(Paragraph("All report charts use one shared master session timeline. Cook Environment streams are evaluated before the derived transfer boundary. Hold Environment streams are evaluated after it. Missing values are preserved and are not interpolated across the smoker-to-hold transfer. Stability and event indicators are application-defined analytical estimates and are not manufacturer-provided Weber metrics.", STYLES["BodyText"]))
 
     doc.build(story, onFirstPage=_header_footer, onLaterPages=_header_footer)
     return buffer.getvalue()
