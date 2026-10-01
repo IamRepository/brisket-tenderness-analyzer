@@ -212,45 +212,94 @@ def build_composite_environment(environment_results):
     return cook, hold_frame
 
 
-def brisket_balance(meat_results):
-    """Compare full-session Point and Flat profiles using bounded raw metrics."""
-    point = None
-    flat = None
-    for label, item in meat_results.items():
-        result = item["result"]
-        if result.detection.session_type != "Cook + Hold":
+def consolidate_meat_profiles(raw_results, manual_gap=None):
+    """Create one continuous profile per physical brisket location.
+
+    Point streams are combined only with Point streams, and Flat streams only
+    with Flat streams. When multiple probes report the same timestamp, their
+    temperatures are averaged once before rendering is calculated.
+    """
+    consolidated = {}
+    for role in (POINT, FLAT):
+        members = [
+            (label, item) for label, item in raw_results.items()
+            if label.split(" — ", 1)[0] == role
+        ]
+        if not members:
             continue
-        role = str(label).split(" — ", 1)[0]
-        if "Point" in role and point is None:
-            point = result
-        elif "Flat" in role and flat is None:
-            flat = result
 
-    if point is None or flat is None:
+        frames = []
+        sources = []
+        source_rows = valid_rows = invalid_rows = duplicate_timestamps = 0
+        for _, item in members:
+            frame = item["valid"][["timestamp", "temperature_c"]].copy()
+            frame["source"] = item["source"]
+            frames.append(frame)
+            sources.append(item["source"])
+            report = item["result"].report
+            source_rows += report.source_rows
+            valid_rows += report.valid_rows
+            invalid_rows += report.invalid_rows
+            duplicate_timestamps += report.duplicate_timestamps
+
+        stacked = pd.concat(frames, ignore_index=True)
+        canonical = (
+            stacked.groupby("timestamp", as_index=False)
+            .agg(temperature_c=("temperature_c", "mean"), contributing_probes=("temperature_c", "count"))
+            .sort_values("timestamp")
+            .reset_index(drop=True)
+        )
+        valid = canonical[["timestamp", "temperature_c"]].copy()
+        report = engine.ParseReport(
+            source_rows=source_rows,
+            valid_rows=len(valid),
+            invalid_rows=invalid_rows,
+            duplicate_timestamps=duplicate_timestamps,
+            first_timestamp=valid["timestamp"].min(),
+            last_timestamp=valid["timestamp"].max(),
+        )
+        detection = engine.classify_session(valid)
+        sample = sampling_info(valid, manual_gap)
+        result = engine.analyse(valid, report, detection, max_gap=sample["threshold"])
+        consolidated[role] = {
+            "result": result,
+            "valid": valid,
+            "source": "; ".join(dict.fromkeys(sources)),
+            "sources": list(dict.fromkeys(sources)),
+            "sample": sample,
+            "contributing_probes": canonical[["timestamp", "contributing_probes"]],
+        }
+    return consolidated
+
+
+def reanalyse_canonical_profiles(canonical_results, transfer_time):
+    """Calculate rendering once per physical location over Cook plus Hold."""
+    updated = {}
+    for role, item in canonical_results.items():
+        result = engine.analyse(
+            item["valid"],
+            item["result"].report,
+            item["result"].detection,
+            pull_override=transfer_time,
+            max_gap=item["sample"]["threshold"],
+        )
+        updated[role] = {**item, "result": result}
+    return updated
+
+
+def overall_brisket_assessment(canonical_results):
+    """Return one whole-brisket assessment from canonical Point and Flat totals."""
+    totals = [item["result"].total for item in canonical_results.values()]
+    if not totals:
         return None
-
-    peak_delta = abs(point.detection.peak_temperature - flat.detection.peak_temperature)
-    cook_delta = abs(point.cook - flat.cook)
-    hold_delta = abs(point.hold - flat.hold)
-
-    if peak_delta < 5:
-        assessment = "Excellent thermal balance"
-    elif peak_delta < 10:
-        assessment = "Good thermal balance"
-    elif peak_delta < 15:
-        assessment = "Uneven thermal development"
-    else:
-        assessment = "Large Point-Flat temperature difference"
-
+    overall_total = float(sum(totals) / len(totals))
     return {
-        "Point peak °C": round(point.detection.peak_temperature, 1),
-        "Flat peak °C": round(flat.detection.peak_temperature, 1),
-        "Peak difference °C": round(peak_delta, 1),
-        "Cook contribution difference": cook_delta,
-        "Hold contribution difference": hold_delta,
-        "Assessment": assessment,
+        "total": overall_total,
+        "assessment": engine.assess(overall_total),
+        "locations": len(totals),
+        "point_total": canonical_results.get(POINT, {}).get("result").total if POINT in canonical_results else None,
+        "flat_total": canonical_results.get(FLAT, {}).get("result").total if FLAT in canonical_results else None,
     }
-
 
 # Step 1
 st.header("Step 1: Upload temperature files")
@@ -316,7 +365,7 @@ st.dataframe(pd.DataFrame(config), hide_index=True, use_container_width=True)
 if not st.button("Analyse session", type="primary", use_container_width=True):
     st.stop()
 
-meat_results, environment_inputs, errors = {}, [], []
+raw_meat_results, environment_inputs, errors = {}, [], []
 for _, row in classifications.iterrows():
     file_label, raw_column = row["File"], row["Column"]
     shown_column = row.get("Display column", pit.normalise_column_name(raw_column))
@@ -331,19 +380,22 @@ for _, row in classifications.iterrows():
             detection = engine.classify_session(valid)
             sample = sampling_info(valid, manual_gap)
             result = engine.analyse(valid, report, detection, max_gap=sample["threshold"])
-            label = unique_label(role, file_label, shown_column, meat_results)
-            meat_results[label] = {"result": result, "valid": valid, "source": display_source(f"{file_label} / {shown_column}"), "sample": sample}
+            label = unique_label(role, file_label, shown_column, raw_meat_results)
+            raw_meat_results[label] = {"result": result, "valid": valid, "source": display_source(f"{file_label} / {shown_column}"), "sample": sample}
         elif role in ENVIRONMENT_ROLES:
             environment_inputs.append({"role": role, "file": file_label, "column": raw_column, "shown": shown_column, "df": active_df, "time": active_time})
     except Exception as exc:
         errors.append(f"{file_label} / {shown_column}: {exc}")
 for error in errors:
     st.error(error)
-if not meat_results:
+if not raw_meat_results:
     st.error("At least one column must be classified as Brisket - Point or Brisket - Flat.")
     st.stop()
 
+meat_results = consolidate_meat_profiles(raw_meat_results, manual_gap)
 transfer_time = derive_transfer_time(meat_results)
+meat_results = reanalyse_canonical_profiles(meat_results, transfer_time)
+overall_assessment = overall_brisket_assessment(meat_results)
 environment_results, environment_sources = {}, {}
 for item in environment_inputs:
     prepared = pit.prepare(item["df"], item["time"], item["column"])
@@ -371,18 +423,13 @@ st.header("Environment integrity")
 integrity = environment_integrity_rows(environment_results)
 st.dataframe(pd.DataFrame(integrity), hide_index=True, use_container_width=True)
 
-balance = brisket_balance(meat_results)
-if balance is not None:
-    st.header("Brisket balance")
-    balance_view = pd.DataFrame([
-        {"Metric": "Point peak", "Value": f"{balance['Point peak °C']:.1f}°C"},
-        {"Metric": "Flat peak", "Value": f"{balance['Flat peak °C']:.1f}°C"},
-        {"Metric": "Peak difference", "Value": f"{balance['Peak difference °C']:.1f}°C"},
-        {"Metric": "Cook contribution difference", "Value": f"{balance['Cook contribution difference']:.1%}"},
-        {"Metric": "Hold contribution difference", "Value": f"{balance['Hold contribution difference']:.1%}"},
-        {"Metric": "Balance assessment", "Value": balance["Assessment"]},
-    ])
-    st.dataframe(balance_view, hide_index=True, use_container_width=True)
+if overall_assessment is not None:
+    st.header("Whole brisket tenderness assessment")
+    cols = st.columns(3)
+    cols[0].metric("Overall rendering", f"{overall_assessment['total']:.1%}")
+    cols[1].metric("Assessment", overall_assessment["assessment"])
+    cols[2].metric("Canonical locations", overall_assessment["locations"])
+    st.caption("Overall rendering is the mean of the canonical Point and Flat totals. Overlapping probes at the same location and timestamp are averaged before rendering is calculated.")
 
 st.header("Brisket probe comparison")
 rows, frames = [], []
@@ -442,7 +489,7 @@ pdf_bytes = build_pdf_report(
     cook_aggregate=cook_aggregate,
     hold_aggregate=hold_aggregate,
     environment_integrity=integrity,
-    balance=balance,
+    overall_assessment=overall_assessment,
 )
 report_slot.download_button("Download full PDF report", data=pdf_bytes, file_name="brisket_session_analysis_full_report.pdf", mime="application/pdf", use_container_width=True)
 st.caption("All charts use one master session timeline. Cook Environment streams are evaluated before the transfer boundary, Hold Environment streams after it, and missing values are not interpolated across transfer.")

@@ -1,22 +1,19 @@
 # Brisket Session Analyser v2.7.0
 
-## Added
+## Rendering interpretation correction
 
-- Environment Integrity section in the application and PDF report.
-- Composite Cook and Hold Environment timelines in the PDF.
-- Point-versus-Flat Brisket Balance section.
-- Peak-temperature, Cook-contribution and Hold-contribution differences.
-- Balance assessment based on Point-versus-Flat peak-temperature difference.
+- Consolidates all Point sources into one canonical Point profile.
+- Consolidates all Flat sources into one canonical Flat profile.
+- Averages simultaneous measurements at the same physical location before analysis.
+- Preserves missing periods and does not interpolate across gaps.
+- Calculates rendering once per physical location over the complete Cook plus Hold timeline.
+- Reports one Point assessment and one Flat assessment, rather than one assessment per uploaded stream.
+- Reports one whole-brisket tenderness assessment based on the mean of canonical Point and Flat rendering totals.
+- Removes the premature Brisket Balance Score feature. Balance scoring is deferred until reporting is validated.
 
 ## Retained
 
-- Master session timeline.
-- Smoker-to-hold transfer marker.
-- Stage-aware meat-probe legends.
-- Point and Environment spelling normalisation.
-- Automatic sampling and gap detection.
-- Separate Cook and Hold environment handling.
-
-## Modelling note
-
-Raw rendering contributions and the existing tenderness assessment remain unchanged. v2.7.0 adds comparison insight but does not recalibrate the tenderness model.
+- v2.6.9 portrait PDF layout.
+- Shared master timeline and transfer markers.
+- One-decimal temperature formatting.
+- Environment labels and source-name normalisation.

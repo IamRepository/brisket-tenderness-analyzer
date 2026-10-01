@@ -79,7 +79,7 @@ def _footer(canvas,doc):canvas.saveState();canvas.setFont('Helvetica',7);canvas.
 def _interval(x):return 'Unknown' if x is None else (f'{x:.0f} sec' if x<60 else (f'{x/60:.1f} min' if x<3600 else f'{x/3600:.2f} h'))
 def _duration(f):return 0 if f is None or len(f)<2 else (f.timestamp.iloc[-1]-f.timestamp.iloc[0]).total_seconds()/3600
 
-def build_pdf_report(app_version,configuration,meat_results,stats,environment_results,transfer_time,environment_sources=None,master_start=None,cook_aggregate=None,hold_aggregate=None,environment_integrity=None,balance=None):
+def build_pdf_report(app_version,configuration,meat_results,stats,environment_results,transfer_time,environment_sources=None,master_start=None,cook_aggregate=None,hold_aggregate=None,environment_integrity=None,overall_assessment=None):
     environment_sources=environment_sources or {}
     environment_integrity=environment_integrity or []
     if master_start is None:
@@ -96,9 +96,21 @@ def build_pdf_report(app_version,configuration,meat_results,stats,environment_re
         integrity_rows = [["Environment role", "Status", "Streams"]]
         integrity_rows += [[x.get("Environment role"), x.get("Status"), x.get("Streams")] for x in environment_integrity]
         s += [Paragraph("Environment integrity", STYLES["Section"]), _table(integrity_rows, [92*mm, 48*mm, 40*mm])]
-    if balance:
-        balance_rows = [["Metric", "Value"], ["Point peak", f"{balance['Point peak °C']:.1f} C"], ["Flat peak", f"{balance['Flat peak °C']:.1f} C"], ["Peak difference", f"{balance['Peak difference °C']:.1f} C"], ["Cook contribution difference", f"{balance['Cook contribution difference']:.1%}"], ["Hold contribution difference", f"{balance['Hold contribution difference']:.1%}"], ["Balance assessment", balance["Assessment"]]]
-        s += [Spacer(1, 4*mm), Paragraph("Brisket balance", STYLES["Section"]), _table(balance_rows, [86*mm, 94*mm])]
+    if overall_assessment:
+        overall_rows = [
+            ["Whole brisket metric", "Value"],
+            ["Overall rendering", f"{overall_assessment['total']:.1%}"],
+            ["Overall tenderness assessment", overall_assessment["assessment"]],
+            ["Canonical locations", overall_assessment["locations"]],
+            ["Point total", "N/A" if overall_assessment.get("point_total") is None else f"{overall_assessment['point_total']:.1%}"],
+            ["Flat total", "N/A" if overall_assessment.get("flat_total") is None else f"{overall_assessment['flat_total']:.1%}"],
+        ]
+        s += [
+            Spacer(1, 4*mm),
+            Paragraph("Whole brisket tenderness assessment", STYLES["Section"]),
+            _table(overall_rows, [86*mm, 94*mm]),
+            Paragraph("Overlapping probes at the same physical location and timestamp are averaged before rendering is calculated. Cook and Hold contributions are integrated once across the canonical Point and Flat profiles.", STYLES["Small"]),
+        ]
     if environment_results:
         er=[['Stream','Source','Stage','Start','End','h','Avg C','Min C','Max C','Stab.']];es=[]
         for label,r in environment_results.items():
