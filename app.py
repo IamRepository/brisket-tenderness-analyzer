@@ -11,7 +11,7 @@ import brisket_engine as engine
 import pit_engine as pit
 from pdf_report import build_pdf_report
 
-APP_VERSION = "2.6.7"
+APP_VERSION = "2.6.8"
 POINT = "🥩 Brisket - Point"
 FLAT = "🥩 Brisket - Flat"
 COOK_PID = "🔥 Cook Environment - PID"
@@ -55,11 +55,21 @@ def interval_text(seconds):
 
 
 def display_source(value):
-    """Normalise common source-header spelling for display only."""
-    text = str(value)
-    text = text.replace(" / Poin", " / Point")
-    text = text.replace(" / Enviroment", " / Environment")
-    return text
+    """Normalise known source-header spelling without repeated substitutions."""
+    text = str(value).strip()
+    if "/" not in text:
+        return text
+
+    file_label, column = [part.strip() for part in text.split("/", 1)]
+    lowered = column.lower()
+
+    # Accept Poin, Point, Pointt, Pointtt, etc., but do not alter other names.
+    if lowered.startswith("poin") and set(lowered[4:]) <= {"t"}:
+        column = "Point"
+    elif lowered == "enviroment":
+        column = "Environment"
+
+    return f"{file_label} / {column}"
 
 
 def stage_display_label(label, result):
@@ -167,30 +177,62 @@ def stream_interval_seconds(frame):
 
 
 def align_environment_to_reference(reference, streams, phase_start=None, phase_end=None):
-    """Align environment streams inside one phase without interpolation."""
+    """Align environment streams without extending data beyond actual coverage.
+
+    Nearest-time matching is allowed only inside each sensor's first and last
+    recorded timestamp. This prevents a later Hold reading from being assigned
+    backwards to an earlier reference timestamp.
+    """
     aligned = reference[["timestamp"]].drop_duplicates().sort_values("timestamp").copy()
     if phase_start is not None:
         aligned = aligned[aligned["timestamp"] >= phase_start]
     if phase_end is not None:
         aligned = aligned[aligned["timestamp"] < phase_end]
+
     columns = []
+    coverage_starts = []
+    coverage_ends = []
+
     for label, result in streams.items():
         stream = result.timeline[["timestamp", "temperature_c"]].dropna().sort_values("timestamp")
         if stream.empty:
             continue
+
+        stream_start = pd.Timestamp(stream["timestamp"].min())
+        stream_end = pd.Timestamp(stream["timestamp"].max())
+        coverage_starts.append(stream_start)
+        coverage_ends.append(stream_end)
+
         interval = stream_interval_seconds(stream)
         tolerance = max((interval or 30.0) * 1.5, 30.0)
         stream = stream.rename(columns={"temperature_c": label})
         aligned = pd.merge_asof(
-            aligned.sort_values("timestamp"), stream, on="timestamp",
-            direction="nearest", tolerance=pd.Timedelta(seconds=tolerance),
+            aligned.sort_values("timestamp"),
+            stream,
+            on="timestamp",
+            direction="nearest",
+            tolerance=pd.Timedelta(seconds=tolerance),
         )
+
+        outside_coverage = ~aligned["timestamp"].between(
+            stream_start, stream_end, inclusive="both"
+        )
+        aligned.loc[outside_coverage, label] = np.nan
         columns.append(label)
+
     if not columns:
         return pd.DataFrame()
+
+    # Remove reference timestamps outside the union of actual stream coverage.
+    coverage_start = min(coverage_starts)
+    coverage_end = max(coverage_ends)
+    aligned = aligned[
+        aligned["timestamp"].between(coverage_start, coverage_end, inclusive="both")
+    ].copy()
+
     aligned["Environment aggregate °C"] = aligned[columns].mean(axis=1, skipna=True)
     aligned["Available sensors"] = aligned[columns].notna().sum(axis=1)
-    return aligned[aligned["Available sensors"] > 0]
+    return aligned[aligned["Available sensors"] > 0].reset_index(drop=True)
 
 
 def environment_coverage(full_frame, segmented_frame, role, boundary):

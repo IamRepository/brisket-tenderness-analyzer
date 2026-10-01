@@ -45,10 +45,18 @@ def _short_label(value):
 
 
 def _display_source(value):
-    text = _text(value)
-    text = text.replace(" / Poin", " / Point")
-    text = text.replace(" / Enviroment", " / Environment")
-    return text
+    """Normalise known source-header spelling without repeated substitutions."""
+    text = _text(value).strip()
+    if "/" not in text:
+        return text
+
+    file_label, column = [part.strip() for part in text.split("/", 1)]
+    lowered = column.lower()
+    if lowered.startswith("poin") and set(lowered[4:]) <= {"t"}:
+        column = "Point"
+    elif lowered == "enviroment":
+        column = "Environment"
+    return f"{file_label} / {column}"
 
 
 def _stage_label(label, result):
@@ -256,7 +264,7 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
         if composite_series:
             story.append(PageBreak())
             story.append(Paragraph("Composite environment timeline", STYLES["Section"]))
-            story.append(Paragraph("Cook and Hold segments share the master timeline. The transfer gap is preserved because the segments remain separate series.", STYLES["Small"]))
+            story.append(Paragraph("Cook and Hold segments share the master timeline. Each aggregate is restricted to actual sensor coverage, and the transfer gap is preserved because the segments remain separate series.", STYLES["Small"]))
             story.append(_table(aggregate_rows, [25*mm, 35*mm, 35*mm, 28*mm, 45*mm, 45*mm], font_size=7))
             story.append(Spacer(1, 4 * mm))
             story.append(_chart(composite_series, "Composite environment temperature", master_start=master_start))
