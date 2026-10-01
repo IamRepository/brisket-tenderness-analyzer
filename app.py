@@ -11,7 +11,7 @@ import brisket_engine as engine
 import pit_engine as pit
 from pdf_report import build_pdf_report
 
-APP_VERSION = "2.6.6"
+APP_VERSION = "2.6.7"
 POINT = "🥩 Brisket - Point"
 FLAT = "🥩 Brisket - Flat"
 COOK_PID = "🔥 Cook Environment - PID"
@@ -52,6 +52,27 @@ def interval_text(seconds):
     if seconds < 3600:
         return f"{seconds / 60:.1f} min"
     return f"{seconds / 3600:.2f} h"
+
+
+def display_source(value):
+    """Normalise common source-header spelling for display only."""
+    text = str(value)
+    text = text.replace(" / Poin", " / Point")
+    text = text.replace(" / Enviroment", " / Environment")
+    return text
+
+
+def stage_display_label(label, result):
+    """Return a concise role and stage label for charts."""
+    role = str(label).split(" — ", 1)[0]
+    role = role.replace("🥩 ", "")
+    if result.detection.session_type == "Cook + Hold":
+        return f"{role} (Cook + Hold)"
+    if result.detection.session_type in ("Hold Only", "Calibration / Hold Test"):
+        return f"{role} (Hold only)"
+    if result.detection.session_type == "Cook Only":
+        return f"{role} (Cook only)"
+    return f"{role} ({result.detection.session_type})"
 
 
 def sampling_info(valid, override=None):
@@ -272,7 +293,7 @@ config = []
 for _, row in classifications.iterrows():
     role = roles[f"{row['File']}_{row['Column']}"]
     if role != IGNORE:
-        config.append({"Role": role, "Source": f"{row['File']} / {row['Column']}"})
+        config.append({"Role": role, "Source": display_source(f"{row['File']} / {row['Column']}")})
 st.subheader("Detected configuration")
 st.dataframe(pd.DataFrame(config), hide_index=True, use_container_width=True)
 if not st.button("Analyse session", type="primary", use_container_width=True):
@@ -296,7 +317,7 @@ for _, row in classifications.iterrows():
             sample = sampling_info(valid, manual_gap)
             result = engine.analyse(valid, report, detection, max_gap=sample["threshold"])
             label = unique_label(role, file_label, str(column), meat_results)
-            meat_results[label] = {"result": result, "valid": valid, "source": f"{file_label} / {column}", "sample": sample}
+            meat_results[label] = {"result": result, "valid": valid, "source": display_source(f"{file_label} / {column}"), "sample": sample}
         elif role in ENVIRONMENT_ROLES:
             environment_inputs.append({"role": role, "file": file_label, "column": column, "df": active_df, "time": active_time})
     except Exception as exc:
@@ -329,7 +350,7 @@ for item in environment_inputs:
             )
             continue
         environment_results[label] = pit.analyse(segmented, item["role"])
-        environment_sources[label] = f"{item['file']} / {item['column']}"
+        environment_sources[label] = display_source(f"{item['file']} / {item['column']}")
     except Exception as exc:
         environment_warnings.append(
             f"{item['file']} / {item['column']}: {exc}"
@@ -354,8 +375,8 @@ st.header("Brisket probe comparison")
 rows, frames = [], []
 for label, item in meat_results.items():
     result = item["result"]
-    rows.append({"Profile": label, "Source": item["source"], "Cook contribution": f"{result.cook:.1%}", "Hold contribution": f"{result.hold:.1%}", "Recorded total": f"{result.total:.1%}", "Assessment": result.assessment if result.complete else "Partial session", "Analysed hours": round(result.analysed_hours, 2)})
-    frame = item["valid"][["timestamp", "temperature_c"]].copy(); frame.columns = ["Timestamp", "Temperature °C"]; frame["Profile"] = label; frames.append(frame)
+    rows.append({"Profile": stage_display_label(label, result), "Source": item["source"], "Cook contribution": f"{result.cook:.1%}", "Hold contribution": f"{result.hold:.1%}", "Recorded total": f"{result.total:.1%}", "Assessment": result.assessment if result.complete else "Partial session", "Analysed hours": round(result.analysed_hours, 2)})
+    frame = item["valid"][["timestamp", "temperature_c"]].copy(); frame.columns = ["Timestamp", "Temperature °C"]; frame["Profile"] = stage_display_label(label, result); frames.append(frame)
 st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
 combined = pd.concat(frames, ignore_index=True)
 st.plotly_chart(px.line(combined, x="Timestamp", y="Temperature °C", color="Profile", title="Brisket - Point and Brisket - Flat"), use_container_width=True, key="brisket_comparison")
@@ -370,6 +391,9 @@ if environment_coverage_rows:
     st.dataframe(pd.DataFrame(environment_coverage_rows), hide_index=True, use_container_width=True)
 
 # Gap 2: phase-aware alignment and aggregation.
+cook_aggregate = pd.DataFrame()
+hold_aggregate = pd.DataFrame()
+composite_environment = pd.DataFrame()
 if environment_results:
     reference = pd.concat(
         [item["valid"][["timestamp"]] for item in meat_results.values()],
@@ -399,11 +423,12 @@ if environment_results:
         aggregate_frames.append(view)
     if aggregate_rows:
         st.dataframe(pd.DataFrame(aggregate_rows), hide_index=True, use_container_width=True)
-        combined_environment = pd.concat(aggregate_frames, ignore_index=True)
+        composite_environment = pd.concat(aggregate_frames, ignore_index=True)
+        composite_environment.rename(columns={"Phase": "Environment stage"}, inplace=True)
         st.plotly_chart(
             px.line(
-                combined_environment, x="timestamp", y="Environment aggregate °C",
-                color="Phase", title="Phase-aware aggregate environment temperature",
+                composite_environment, x="timestamp", y="Environment aggregate °C",
+                color="Environment stage", title="Composite environment temperature",
             ),
             use_container_width=True, key="phase_environment_aggregate",
         )
@@ -486,6 +511,8 @@ pdf_bytes = build_pdf_report(
     environment_sources=environment_sources,
     transfer_time=transfer_time,
     master_start=master_start,
+    cook_aggregate=cook_aggregate,
+    hold_aggregate=hold_aggregate,
 )
 report_slot.download_button(
     "Download full PDF report",

@@ -44,6 +44,25 @@ def _short_label(value):
     return text.strip()
 
 
+def _display_source(value):
+    text = _text(value)
+    text = text.replace(" / Poin", " / Point")
+    text = text.replace(" / Enviroment", " / Environment")
+    return text
+
+
+def _stage_label(label, result):
+    role = _short_label(label)
+    session_type = result.detection.session_type
+    if session_type == "Cook + Hold":
+        return f"{role} (Cook + Hold)"
+    if session_type in ("Hold Only", "Calibration / Hold Test"):
+        return f"{role} (Hold only)"
+    if session_type == "Cook Only":
+        return f"{role} (Cook only)"
+    return f"{role} ({session_type})"
+
+
 def _table(data, widths=None, header=True, font_size=7.5):
     wrapped = [[Paragraph(_text(cell), STYLES["Cell"]) for cell in row] for row in data]
     table = Table(wrapped, colWidths=widths, repeatRows=1 if header else 0, hAlign="LEFT")
@@ -146,7 +165,7 @@ STYLES.add(ParagraphStyle(name="Small", parent=STYLES["BodyText"], fontSize=7.5,
 STYLES.add(ParagraphStyle(name="Centre", parent=STYLES["BodyText"], alignment=TA_CENTER))
 
 
-def build_pdf_report(app_version, configuration, meat_results, stats, environment_results, transfer_time, environment_sources=None, master_start=None):
+def build_pdf_report(app_version, configuration, meat_results, stats, environment_results, transfer_time, environment_sources=None, master_start=None, cook_aggregate=None, hold_aggregate=None):
     """Return a complete analysis report as PDF bytes."""
     environment_sources = environment_sources or {}
     if master_start is None:
@@ -179,12 +198,13 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
     story.append(Paragraph("Tenderness and rendering calculations are based on brisket time-temperature and hot-hold concepts shared by Steve Gow. This application is an independent implementation and is not affiliated with or endorsed by Steve Gow. Results are analytical estimates and should be considered alongside probe tenderness and safe food handling.", STYLES["BodyText"]))
 
     story.append(Paragraph("Configuration", STYLES["Section"]))
-    conf_data = [["Role", "Source"]] + [[r.get("Role"), r.get("Source")] for r in configuration]
+    conf_data = [["Role", "Source"]] + [[r.get("Role"), _display_source(r.get("Source"))] for r in configuration]
     story.append(_table(conf_data, [95 * mm, 135 * mm]))
     story.append(Spacer(1, 4 * mm))
     boundary = _text(transfer_time) if transfer_time is not None else "Not detected"
     story.append(_table([["Master timeline start", _text(master_start)], ["Derived smoker-to-hold boundary", boundary]], [80 * mm, 150 * mm], header=False))
 
+    story.append(PageBreak())
     story.append(Paragraph("Session detection summary", STYLES["Section"]))
     rows = [["Profile", "Source", "Session", "Confidence", "Pull", "Peak C", "Average C", "Minimum C", "Cook h", "Hold h", "Average cook C", "Average hold C", "Sampling", "Gap threshold"]]
     for label, item in meat_results.items():
@@ -192,7 +212,7 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
         stat = stats[label]
         sample = item["sample"]
         rows.append([
-            _short_label(label), item["source"], result.detection.session_type, f"{result.detection.confidence}%", _text(result.detection.pull_timestamp),
+            _stage_label(label, result), _display_source(item["source"]), result.detection.session_type, f"{result.detection.confidence}%", _text(result.detection.pull_timestamp),
             f"{result.detection.peak_temperature:.1f}", f"{result.detection.average_temperature:.1f}", f"{result.detection.minimum_temperature:.1f}",
             f"{stat['cook_h']:.2f}", f"{stat['hold_h']:.2f}", _text(None if stat['cook_avg'] is None else round(stat['cook_avg'], 1)),
             _text(None if stat['hold_avg'] is None else round(stat['hold_avg'], 1)),
@@ -206,8 +226,8 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
     meat_series = []
     for label, item in meat_results.items():
         result = item["result"]
-        comparison.append([_short_label(label), item["source"], f"{result.cook:.1%}", f"{result.hold:.1%}", f"{result.total:.1%}", result.assessment if result.complete else "Partial session", f"{result.analysed_hours:.2f}"])
-        meat_series.append((_short_label(label), item["valid"], "timestamp", "temperature_c"))
+        comparison.append([_stage_label(label, result), _display_source(item["source"]), f"{result.cook:.1%}", f"{result.hold:.1%}", f"{result.total:.1%}", result.assessment if result.complete else "Partial session", f"{result.analysed_hours:.2f}"])
+        meat_series.append((_stage_label(label, result), item["valid"], "timestamp", "temperature_c"))
     story.append(_table(comparison, [52*mm, 45*mm, 27*mm, 27*mm, 24*mm, 65*mm, 22*mm]))
     story.append(Spacer(1, 4 * mm))
     story.append(_chart(meat_series, "Brisket Point and Flat temperature profiles", master_start=master_start))
@@ -219,23 +239,39 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
         env_series = []
         for label, result in environment_results.items():
             frame = result.timeline
-            env_rows.append([_short_label(label), environment_sources.get(label, "N/A"), _short_label(result.role), _text(frame['timestamp'].min()), _text(frame['timestamp'].max()), f"{_duration(frame):.2f}", f"{result.average:.1f}", f"{result.minimum:.1f}", f"{result.maximum:.1f}", f"{result.stability_score:.0f}/100"])
+            env_rows.append([_short_label(label), _display_source(environment_sources.get(label, "N/A")), _short_label(result.role), _text(frame['timestamp'].min()), _text(frame['timestamp'].max()), f"{_duration(frame):.2f}", f"{result.average:.1f}", f"{result.minimum:.1f}", f"{result.maximum:.1f}", f"{result.stability_score:.0f}/100"])
             env_series.append((_short_label(label), frame, "timestamp", "temperature_c"))
         story.append(_table(env_rows, [40*mm, 38*mm, 35*mm, 27*mm, 27*mm, 17*mm, 17*mm, 17*mm, 17*mm, 18*mm], font_size=6.5))
         story.append(Spacer(1, 4 * mm))
         story.append(_chart(env_series, "Cook and Hold Environment profiles", master_start=master_start))
+
+        composite_series = []
+        aggregate_rows = [["Stage", "Start", "End", "Aligned readings", "Average environment C", "Average available sensors"]]
+        if cook_aggregate is not None and not cook_aggregate.empty:
+            composite_series.append(("Composite Environment (Cook)", cook_aggregate, "timestamp", "Environment aggregate °C"))
+            aggregate_rows.append(["Cook", _text(cook_aggregate["timestamp"].min()), _text(cook_aggregate["timestamp"].max()), len(cook_aggregate), f"{cook_aggregate['Environment aggregate °C'].mean():.1f}", f"{cook_aggregate['Available sensors'].mean():.2f}"])
+        if hold_aggregate is not None and not hold_aggregate.empty:
+            composite_series.append(("Composite Environment (Hold)", hold_aggregate, "timestamp", "Environment aggregate °C"))
+            aggregate_rows.append(["Hold", _text(hold_aggregate["timestamp"].min()), _text(hold_aggregate["timestamp"].max()), len(hold_aggregate), f"{hold_aggregate['Environment aggregate °C'].mean():.1f}", f"{hold_aggregate['Available sensors'].mean():.2f}"])
+        if composite_series:
+            story.append(PageBreak())
+            story.append(Paragraph("Composite environment timeline", STYLES["Section"]))
+            story.append(Paragraph("Cook and Hold segments share the master timeline. The transfer gap is preserved because the segments remain separate series.", STYLES["Small"]))
+            story.append(_table(aggregate_rows, [25*mm, 35*mm, 35*mm, 28*mm, 45*mm, 45*mm], font_size=7))
+            story.append(Spacer(1, 4 * mm))
+            story.append(_chart(composite_series, "Composite environment temperature", master_start=master_start))
     else:
         story.append(Paragraph("No environment streams were included in this analysis.", STYLES["BodyText"]))
 
     for label, item in meat_results.items():
         result = item["result"]
         story.append(PageBreak())
-        story.append(Paragraph(_short_label(label), STYLES["Section"]))
-        story.append(Paragraph(f"Source: {_text(item['source'])}", STYLES["Small"]))
+        story.append(Paragraph(_stage_label(label, result), STYLES["Section"]))
+        story.append(Paragraph(f"Source: {_display_source(item['source'])}", STYLES["Small"]))
         stat = stats[label]
         metrics = [
             ["Metric", "Value", "Metric", "Value"],
-            ["Source", item["source"], "Session", result.detection.session_type],
+            ["Source", _display_source(item["source"]), "Session", result.detection.session_type],
             ["Confidence", f"{result.detection.confidence}%", "Detected pull", _text(result.detection.pull_timestamp)],
             ["Cook duration", f"{stat['cook_h']:.2f} h", "Hold duration", f"{stat['hold_h']:.2f} h"],
             ["Cook contribution", f"{result.cook:.1%}", "Hold contribution", f"{result.hold:.1%}"],
@@ -245,7 +281,7 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
         ]
         story.append(_table(metrics, [45*mm, 85*mm, 45*mm, 85*mm]))
         story.append(Spacer(1, 3 * mm))
-        story.append(_chart([(_short_label(label), item["valid"], "timestamp", "temperature_c")], f"Temperature profile - {_short_label(label)}", master_start=master_start))
+        story.append(_chart([(_stage_label(label, result), item["valid"], "timestamp", "temperature_c")], f"Temperature profile - {_stage_label(label, result)}", master_start=master_start))
         bands = result.summary[result.summary["Duration hours"] > 0].copy()
         if not bands.empty:
             story.append(Paragraph("Rendering band calculation", STYLES["Subsection"]))
