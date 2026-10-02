@@ -10,7 +10,7 @@ import brisket_engine as engine
 import pit_engine as pit
 from pdf_report import build_pdf_report
 
-APP_VERSION = "2.7.0"
+APP_VERSION = "2.7.1"
 POINT = pit.POINT
 FLAT = pit.FLAT
 COOK_PID = pit.COOK_PID
