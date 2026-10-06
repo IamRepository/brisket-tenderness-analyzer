@@ -1,8 +1,10 @@
 from __future__ import annotations
 
+from datetime import datetime, timezone
 from html import escape
 from io import BytesIO
 import re
+from zoneinfo import ZoneInfo
 
 import pandas as pd
 import plotly.express as px
@@ -13,7 +15,7 @@ import pit_engine as pit
 from pdf_report import build_pdf_report
 
 APP_NAME = "Brisket Tenderness Analyzer"
-APP_VERSION = "2.8.1"
+APP_VERSION = "2.8.2"
 POINT = pit.POINT
 FLAT = pit.FLAT
 COOK_PID = pit.COOK_PID
@@ -21,6 +23,7 @@ COOK_GRATE = pit.COOK_GRATE
 HOLD_ENV = pit.HOLD_ENV
 IGNORE = pit.IGNORE
 MEAT_ROLES = {POINT, FLAT}
+SPREAD_WARNING = 0.25  # Point/Flat totals this far apart (25 points) get a note even within one assessment band
 ENVIRONMENT_ROLES = {COOK_PID, COOK_GRATE, HOLD_ENV}
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="🔥", layout="wide")
@@ -132,18 +135,28 @@ def unique_label(role, file_label, column, existing):
     return base if base not in existing else f"{role} — {file_label} / {column}"
 
 
-def phase_stats(valid, detection):
+def phase_stats(valid, detection, transfer_time=None):
+    """Cook and hold hours and averages, split where rendering is split.
+
+    Rendering uses the shared transfer time, so the hours do too. A profile's
+    own detected pull is only used when no transfer time could be derived.
+    """
     work = valid.sort_values("timestamp").copy()
     work["elapsed"] = (work["timestamp"].shift(-1) - work["timestamp"]).dt.total_seconds()
     work = work[work["elapsed"].notna() & (work["elapsed"] > 0)]
-    pull = detection.pull_timestamp
+    pull = transfer_time if transfer_time is not None else detection.pull_timestamp
     if detection.session_type == "Cook Only":
         cook, hold = work, work.iloc[0:0]
     elif detection.session_type in ("Hold Only", "Calibration / Hold Test"):
         cook, hold = work.iloc[0:0], work
     elif pull is not None:
+        # Split each interval at the transfer, as the rendering calculation does.
         pull = pd.Timestamp(pull)
-        cook, hold = work[work["timestamp"] < pull], work[work["timestamp"] >= pull]
+        cook_seconds = (pull - work["timestamp"]).dt.total_seconds().clip(lower=0)
+        cook_seconds = cook_seconds.where(cook_seconds < work["elapsed"], work["elapsed"])
+        cook = work.assign(elapsed=cook_seconds)
+        hold = work.assign(elapsed=work["elapsed"] - cook_seconds)
+        cook, hold = cook[cook["elapsed"] > 0], hold[hold["elapsed"] > 0]
     else:
         cook, hold = work.iloc[0:0], work.iloc[0:0]
 
@@ -343,12 +356,25 @@ def overall_brisket_assessment(canonical_results):
     if not totals:
         return None
     overall_total = float(sum(totals) / len(totals))
+    point_total = canonical_results[POINT]["result"].total if POINT in canonical_results else None
+    flat_total = canonical_results[FLAT]["result"].total if FLAT in canonical_results else None
+    spread_note = None
+    if point_total is not None and flat_total is not None:
+        point_text, flat_text = engine.assess(point_total), engine.assess(flat_total)
+        gap = abs(point_total - flat_total)
+        if point_text != flat_text or gap >= SPREAD_WARNING:
+            spread_note = (
+                f"Point and Flat differ by {gap * 100:.0f} percentage points "
+                f"(Point {point_total:.1%}, {point_text.lower()}; Flat {flat_total:.1%}, {flat_text.lower()}). "
+                "The overall figure is their average and describes neither end on its own; read them separately."
+            )
     return {
         "total": overall_total,
         "assessment": engine.assess(overall_total),
         "locations": len(totals),
-        "point_total": canonical_results.get(POINT, {}).get("result").total if POINT in canonical_results else None,
-        "flat_total": canonical_results.get(FLAT, {}).get("result").total if FLAT in canonical_results else None,
+        "point_total": point_total,
+        "flat_total": flat_total,
+        "spread_note": spread_note,
     }
 
 # Step 1
@@ -409,7 +435,8 @@ for _, row in classifications.iterrows():
     role = roles[f"{row['File']}_{row['Column']}"]
     if role != IGNORE:
         shown = row.get("Display column", pit.normalise_column_name(row["Column"]))
-        config.append({"Role": role, "Source": display_source(f"{row['File']} / {shown}")})
+        file_name = primary_name if row["File"] == "Primary" else secondary_name
+        config.append({"Role": role, "Source": display_source(f"{row['File']} / {shown}"), "File name": file_name})
 st.subheader("Detected configuration")
 st.dataframe(pd.DataFrame(config), hide_index=True, use_container_width=True)
 if st.button("Analyse session", type="primary", use_container_width=True):
@@ -467,7 +494,7 @@ if transfer_time is not None:
 summary, stats = [], {}
 for label, item in meat_results.items():
     result = item["result"]
-    stat = phase_stats(item["valid"], result.detection)
+    stat = phase_stats(item["valid"], result.detection, transfer_time)
     stats[label] = stat
     pull = result.detection.pull_timestamp
     one_decimal = lambda v: "" if v is None else f"{v:.1f}"
@@ -506,6 +533,8 @@ if overall_assessment is not None:
         ("Assessment", overall_assessment["assessment"], True),
         ("Canonical locations", overall_assessment["locations"], False),
     ])
+    if overall_assessment["spread_note"]:
+        st.warning(overall_assessment["spread_note"])
     st.caption("Overall rendering is the mean of the canonical Point and Flat totals. Probes at the same location are averaged over time before rendering is calculated.")
 
 st.header("Brisket probe comparison")
@@ -528,7 +557,7 @@ if environment_results:
     env_rows, env_frames = [], []
     for label, result in environment_results.items():
         stage = "Hold" if result.role == HOLD_ENV else "Cook"
-        env_rows.append({"Environment stream": label.split(" — ", 1)[0].replace("🔥 ", "").replace("🌡 ", "").replace("♨ ", ""), "Source": environment_sources[label], "Stage": stage, "Start": result.timeline["timestamp"].min(), "End": result.timeline["timestamp"].max(), "Duration hours": round(duration_hours(result.timeline), 2), "Average °C": round(result.average, 1), "Minimum °C": round(result.minimum, 1), "Maximum °C": round(result.maximum, 1), "Stability": round(result.stability_score)})
+        env_rows.append({"Environment stream": label.split(" — ", 1)[0].replace("🔥 ", "").replace("🌡 ", "").replace("♨ ", ""), "Source": environment_sources[label], "Stage": stage, "Start": result.timeline["timestamp"].min(), "End": result.timeline["timestamp"].max(), "Duration hours": round(duration_hours(result.timeline), 2), "Average °C": round(result.average, 1), "Minimum °C": round(result.minimum, 1), "Maximum °C": round(result.maximum, 1), "Stability": round(result.stability_score), "Level changes": result.level_changes})
         frame = elapsed_frame(result.timeline, master_start)
         frame["Environment stream"] = label.split(" — ", 1)[0].replace("🔥 ", "").replace("🌡 ", "").replace("♨ ", "")
         env_frames.append(frame)
@@ -553,6 +582,17 @@ for index, (label, item) in enumerate(meat_results.items()):
         detail = add_transfer_marker(detail, transfer_time, master_start)
         st.plotly_chart(detail, use_container_width=True, key=f"temperature_{index}")
 
+def report_time():
+    """Now in the viewer's time zone (from the browser); UTC if it is unknown."""
+    try:
+        zone = st.context.timezone
+        if zone:
+            return datetime.now(ZoneInfo(zone))
+    except Exception:
+        pass
+    return datetime.now(timezone.utc)
+
+
 cook_aggregate, hold_aggregate = build_composite_environment(environment_results)
 pdf_bytes = build_pdf_report(
     app_version=APP_VERSION,
@@ -567,6 +607,7 @@ pdf_bytes = build_pdf_report(
     hold_aggregate=hold_aggregate,
     environment_integrity=integrity,
     overall_assessment=overall_assessment,
+    generated_at=report_time(),
 )
 report_name = f"brisket_tenderness_report_{pd.Timestamp(master_start):%Y-%m-%d}.pdf" if master_start is not None else "brisket_tenderness_report.pdf"
 report_slot.download_button("📄 Download full PDF report", data=pdf_bytes, file_name=report_name, mime="application/pdf", type="primary", use_container_width=True, on_click="ignore")

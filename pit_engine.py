@@ -27,6 +27,8 @@ class PitResult:
     stddev: float
     stability_score: float
     lid_events: pd.DataFrame
+    level_changes: int = 0
+    steady_share: float = 1.0
 
 
 def normalise_column_name(value: str) -> str:
@@ -117,14 +119,59 @@ def prepare(df: pd.DataFrame, timestamp_col: str, temp_col: str) -> pd.DataFrame
     )
 
 
+BASELINE_WINDOW = "60min"      # rolling median that follows deliberate setpoint steps
+RAMP_SPAN = "15min"            # span over which the baseline's movement is measured
+RAMP_RATE_C_PER_H = 10.0       # baseline moving faster than this = changing level, not holding
+LEVEL_STEP_C = 5.0             # a held level this far from the previous one counts as a change
+MIN_LEVEL_HOLD = "30min"       # a level must be held this long to count
+
+
+def steady_stability(prepared: pd.DataFrame) -> tuple[float, int, float]:
+    """Stability while the cooker holds a temperature, ignoring planned steps.
+
+    The baseline is a centred one-hour rolling median of the readings, which
+    follows a stepped program (e.g. 80 -> 110 -> 150 C) without smearing it.
+    Readings taken while that baseline is ramping are left out; the score uses
+    the remaining readings' deviation from the baseline and their reading-to-
+    reading changes, on the same 0-100 scale as before.
+    Returns (score, number of level changes, share of readings that were steady).
+    """
+    frame = prepared[["timestamp", "temperature_c"]].dropna().sort_values("timestamp")
+    if len(frame) < 3:
+        return 100.0, 0, 1.0
+    series = pd.Series(frame["temperature_c"].astype(float).to_numpy(), index=pd.DatetimeIndex(frame["timestamp"]))
+    baseline = series.rolling(BASELINE_WINDOW, center=True, min_periods=1).median()
+    # How far the baseline moved in the last 15 minutes, as a rate. Measuring over
+    # 15 minutes keeps sensor noise from looking like a ramp at fast sampling.
+    window = baseline.rolling(RAMP_SPAN, closed="both", min_periods=1)
+    moved = window.max() - window.min()
+    steady = moved <= RAMP_RATE_C_PER_H * pd.Timedelta(RAMP_SPAN).total_seconds() / 3600
+    if steady.sum() < 2:
+        return 0.0, 0, float(steady.mean())
+
+    residual = (series - baseline)[steady]
+    changes = series.diff().abs()[steady & steady.shift(1, fill_value=False)]
+    median_change = float(changes.median()) if not changes.empty else 0.0
+    score = float(np.clip(100 - 4 * float(residual.std(ddof=0)) - 8 * median_change, 0, 100))
+
+    # Count held levels: steady stretches of at least MIN_LEVEL_HOLD whose medians differ by LEVEL_STEP_C or more.
+    run_id = (steady != steady.shift(fill_value=False)).cumsum()[steady]
+    levels = []
+    for r in run_id.unique():
+        stretch = series[steady][run_id == r]
+        if stretch.index[-1] - stretch.index[0] >= pd.Timedelta(MIN_LEVEL_HOLD):
+            levels.append(float(stretch.median()))
+    level_changes = sum(1 for a, b in zip(levels, levels[1:]) if abs(b - a) >= LEVEL_STEP_C)
+    return score, level_changes, float(steady.mean())
+
+
 def analyse(prepared: pd.DataFrame, role: str) -> PitResult:
     if prepared.empty:
         raise ValueError("The selected environmental profile contains no valid data.")
 
     values = prepared["temperature_c"].astype(float)
     stddev = float(values.std(ddof=0))
-    median_change = float(values.diff().abs().median()) if len(values) > 1 else 0.0
-    stability_score = float(np.clip(100 - 4 * stddev - 8 * median_change, 0, 100))
+    stability_score, level_changes, steady_share = steady_stability(prepared)
 
     lid_events = pd.DataFrame()
     if role == COOK_GRATE and len(prepared) > 4:
@@ -147,6 +194,8 @@ def analyse(prepared: pd.DataFrame, role: str) -> PitResult:
         stddev=round(stddev, 2),
         stability_score=stability_score,
         lid_events=lid_events,
+        level_changes=level_changes,
+        steady_share=steady_share,
     )
 
 
