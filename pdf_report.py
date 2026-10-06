@@ -7,10 +7,8 @@ from reportlab.lib.pagesizes import A4
 from reportlab.lib.styles import getSampleStyleSheet, ParagraphStyle
 from reportlab.lib.units import mm
 from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, TableStyle, CondPageBreak, KeepTogether
-from reportlab.graphics.shapes import Drawing, Line, String
-from reportlab.graphics.charts.lineplots import LinePlot
-from reportlab.graphics.charts.legends import Legend
-from reportlab.graphics.widgets.markers import makeMarker
+from reportlab.graphics.shapes import Drawing, Line, String, Group, PolyLine, Circle
+from reportlab.pdfbase.pdfmetrics import stringWidth
 
 DARK=colors.HexColor('#27343B'); ACCENT=colors.HexColor('#A94722'); LIGHT=colors.HexColor('#F3F5F6'); GRID=colors.HexColor('#D6DCE0'); TRANSFER=colors.HexColor('#7A3E9D')
 PALETTE=[colors.HexColor(x) for x in ('#C6532B','#2F6B9A','#5B7F4B','#8A5A9B','#C18B2F')]; CONTENT=A4[0]-28*mm
@@ -60,23 +58,121 @@ def _table(rows,widths,size=7.1,header=True,centre=()):
     if header:cmd += [('BACKGROUND',(0,0),(-1,0),DARK),('TEXTCOLOR',(0,0),(-1,0),colors.white),('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,LIGHT])]
     t.setStyle(TableStyle(cmd));return t
 
-def _chart(series,title,origin=None,transfer=None):
-    d=Drawing(CONTENT,94*mm);c=LinePlot();c.x=15*mm;c.y=27*mm;c.width=CONTENT-27*mm;c.height=50*mm;data=[];names=[];xs=[];ys=[]
-    for name,f,tc,vc in series:
+# One colour per entity, matching the app (validated categorical order).
+SERIES_COLOURS={'point':'#2a78d6','flat':'#eb6834','pid':'#1baf7a','grate':'#eda100','hold':'#e87ba4'}
+FALLBACK_COLOURS=['#4a3aa7','#008300','#e34948']
+INK=colors.HexColor('#27343B'); MUTED=colors.HexColor('#52514e'); GRIDLINE=colors.HexColor('#E3E6E8')
+
+def _colour(name,index):
+    text=str(name).lower()
+    for key,hexcode in SERIES_COLOURS.items():
+        if key in text:return colors.HexColor(hexcode)
+    return colors.HexColor(FALLBACK_COLOURS[index%len(FALLBACK_COLOURS)])
+
+def _nice_step(span,target):
+    """A round step (1, 2, 2.5, 5 x 10^n) giving about `target` intervals."""
+    import math
+    if span<=0:return 1.0
+    raw=span/target;power=10**math.floor(math.log10(raw))
+    for m in (1,2,2.5,5,10):
+        if raw<=m*power:return m*power
+    return 10*power
+
+def _segments(hours,values,max_gap_h):
+    """Split a series wherever readings are further apart than max_gap_h, so gaps stay empty."""
+    out=[];current=[]
+    for i,(x,y) in enumerate(zip(hours,values)):
+        if current and x-current[-1][0]>max_gap_h:
+            out.append(current);current=[]
+        current.append((x,y))
+    if current:out.append(current)
+    return out
+
+def _chart(series,title,origin=None,transfer=None,unit='°C',band=None,height=88*mm):
+    """Line chart on the master timeline.
+
+    series: (name, frame, time column, value column). Lines only (no point
+    markers), broken at recording gaps, one fixed colour per entity, legend
+    above the plot, light gridlines, round axis steps. band=(low, high, label)
+    shades a horizontal range, e.g. the ideal rendering range.
+    """
+    d=Drawing(CONTENT,height)
+    left,right,bottom=17*mm,4*mm,13*mm
+    top=height-21*mm            # room above the plot for title, legend and transfer label
+    plot_w=CONTENT-left-right;plot_h=top-bottom
+    lines=[];xs=[];ys=[]
+    for index,(name,f,tc,vc) in enumerate(series):
         q=f[[tc,vc]].dropna().sort_values(tc)
         if q.empty:continue
-        if len(q)>350:q=q.iloc[::max(len(q)//350,1)]
-        base=pd.Timestamp(origin) if origin is not None else q[tc].min();xx=(q[tc]-base).dt.total_seconds()/3600;yy=pd.to_numeric(q[vc],errors='coerce');pts=[(float(x),float(y)) for x,y in zip(xx,yy) if pd.notna(y)]
-        if pts:data.append(pts);names.append(_short(name));xs.extend(x for x,_ in pts);ys.extend(y for _,y in pts)
-    if not data:return Paragraph('No chart data available.',STYLES['BodyText'])
-    xmin,xmax=min(xs),max(xs);c.data=data;c.xValueAxis.valueMin=xmin;c.xValueAxis.valueMax=xmax if xmax>xmin else xmin+1;c.xValueAxis.labelTextFormat='%0.1f';c.xValueAxis.labels.fontSize=7;c.yValueAxis.valueMin=min(ys)-2;c.yValueAxis.valueMax=max(ys)+2;c.yValueAxis.labels.fontSize=7
-    for i in range(len(data)):c.lines[i].strokeColor=PALETTE[i%len(PALETTE)];c.lines[i].strokeWidth=1.2;c.lines[i].symbol=makeMarker('FilledCircle');c.lines[i].symbol.size=1.7
-    l=Legend();l.x=15*mm;l.y=17*mm;l.fontSize=6.2;l.deltax=76;l.deltay=9;l.columnMaximum=2;l.colorNamePairs=[(PALETTE[i%len(PALETTE)],names[i]) for i in range(len(names))]
-    d.add(c);d.add(l);d.add(String(15*mm,83*mm,title,fontName='Helvetica-Bold',fontSize=10.5,fillColor=DARK));d.add(String(15*mm,4*mm,'Elapsed time from master session start (hours)',fontSize=6.5));d.add(String(1*mm,48*mm,'Temperature (°C)',fontSize=6.5))
+        base=pd.Timestamp(origin) if origin is not None else q[tc].min()
+        hours=((q[tc]-base).dt.total_seconds()/3600).to_numpy();values=pd.to_numeric(q[vc],errors='coerce').to_numpy()
+        steps=pd.Series(hours).diff().dropna();steps=steps[steps>0]
+        max_gap=max(float(steps.median())*3,float(steps.median())+1/3600) if not steps.empty else float('inf')
+        if len(q)>600:   # thin very dense series for file size; gaps are found first
+            keep=max(len(q)//600,1);segments=[seg[::keep]+[seg[-1]] for seg in _segments(hours,values,max_gap)]
+        else:
+            segments=_segments(hours,values,max_gap)
+        lines.append((_short(name),_colour(name,index),segments))
+        xs.extend(hours);ys.extend(v for v in values if pd.notna(v))
+    if not lines:return Paragraph('No chart data available.',STYLES['BodyText'])
+
+    xmin,xmax=min(xs),max(xs)
+    if band:ys+= [band[0],band[1]]
+    xstep=_nice_step(xmax-xmin,8);xlo=xstep*(xmin//xstep);xhi=xstep*-(-xmax//xstep)
+    ystep=_nice_step(max(ys)-min(ys),5);ylo=ystep*(min(ys)//ystep);yhi=ystep*-(-max(ys)//ystep)
+    if yhi==ylo:yhi=ylo+ystep
+    if xhi==xlo:xhi=xlo+xstep
+    px=lambda x:left+(x-xlo)/(xhi-xlo)*plot_w
+    py=lambda y:bottom+(y-ylo)/(yhi-ylo)*plot_h
+    label_fmt=(lambda v:f'{v:g}')
+
+    # Title and legend (one row of swatches; wraps if it runs out of width)
+    d.add(String(left,height-6*mm,title,fontName='Helvetica-Bold',fontSize=10,fillColor=INK))
+    lx,ly=left,height-12*mm
+    for name,colour,_ in lines:
+        width=14+stringWidth(name,'Helvetica',7)+12
+        if lx+width>left+plot_w:lx=left;ly-=9
+        d.add(Line(lx,ly+2.5,lx+10,ly+2.5,strokeColor=colour,strokeWidth=2))
+        d.add(String(lx+14,ly,name,fontName='Helvetica',fontSize=7,fillColor=MUTED))
+        lx+=width
+
+    # Grid and axes
+    if band:
+        from reportlab.graphics.shapes import Rect
+        d.add(Rect(left,py(band[0]),plot_w,py(band[1])-py(band[0]),fillColor=colors.Color(0.05,0.64,0.05,alpha=0.13),strokeColor=None))
+        d.add(String(left+3,py(band[1])-8,band[2],fontName='Helvetica',fontSize=6.5,fillColor=colors.HexColor('#0a7a0a')))
+    y=ylo
+    while y<=yhi+1e-9:
+        d.add(Line(left,py(y),left+plot_w,py(y),strokeColor=GRIDLINE,strokeWidth=0.5))
+        d.add(String(left-3,py(y)-2.3,label_fmt(y),fontName='Helvetica',fontSize=6.5,fillColor=MUTED,textAnchor='end'))
+        y+=ystep
+    x=xlo
+    while x<=xhi+1e-9:
+        d.add(Line(px(x),bottom,px(x),bottom+plot_h,strokeColor=GRIDLINE,strokeWidth=0.5))
+        d.add(String(px(x),bottom-8,label_fmt(x),fontName='Helvetica',fontSize=6.5,fillColor=MUTED,textAnchor='middle'))
+        x+=xstep
+    d.add(Line(left,bottom,left+plot_w,bottom,strokeColor=MUTED,strokeWidth=0.6))
+    d.add(String(left+plot_w/2,1.5*mm,'Elapsed time from session start (hours)',fontName='Helvetica',fontSize=7,fillColor=MUTED,textAnchor='middle'))
+    ylabel=Group(String(0,0,f'Rendering ({unit})' if unit=='%' else f'Temperature ({unit})',fontName='Helvetica',fontSize=7,fillColor=MUTED,textAnchor='middle'))
+    ylabel.transform=(0,1,-1,0,4*mm,bottom+plot_h/2)   # rotated 90 degrees, clear of the tick labels
+    d.add(ylabel)
+
+    # Transfer marker: dashed line, label above the plot so it never sits on a curve
     if transfer is not None and origin is not None:
         th=(pd.Timestamp(transfer)-pd.Timestamp(origin)).total_seconds()/3600
-        if xmin<=th<=xmax:
-            mx=c.x+(th-xmin)/max(xmax-xmin,1e-9)*c.width;d.add(Line(mx,c.y,mx,c.y+c.height,strokeColor=TRANSFER,strokeWidth=1,strokeDashArray=[3,2]));d.add(String(mx+2,c.y+c.height-7,'Transfer',fontSize=6.5,fillColor=TRANSFER))
+        if xlo<=th<=xhi:
+            mx=px(th)
+            d.add(Line(mx,bottom,mx,bottom+plot_h+3,strokeColor=MUTED,strokeWidth=0.9,strokeDashArray=[3,2]))
+            d.add(String(mx+2,bottom+plot_h+4,'Smoker to hold',fontName='Helvetica',fontSize=6.5,fillColor=MUTED))
+
+    # Data lines last, so they sit on top of the grid
+    for name,colour,segments in lines:
+        for seg in segments:
+            pts=[(px(x),py(y)) for x,y in seg if pd.notna(y)]
+            if len(pts)>=2:
+                d.add(PolyLine([c for p in pts for c in p],strokeColor=colour,strokeWidth=1.5,strokeLineJoin=1,strokeLineCap=1))
+            elif pts:
+                d.add(Circle(pts[0][0],pts[0][1],1.2,fillColor=colour,strokeColor=None))
     return d
 
 def _footer(canvas,doc):canvas.saveState();canvas.setFont('Helvetica',7);canvas.setFillColor(DARK);canvas.drawString(14*mm,8*mm,'Brisket Tenderness Analyzer - analytical report');canvas.drawRightString(A4[0]-14*mm,8*mm,f'Page {doc.page}');canvas.restoreState()
@@ -195,11 +291,22 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
                   "No shared transfer time was derived; hours are split at each profile's detected pull.")
     s += [CondPageBreak(80*mm), section('Session details'),
           _table(timing, [42*mm, 40*mm, 24*mm, 13*mm, 29*mm, 17*mm, 17*mm], 6.8), small(split_note), Spacer(1, 4*mm),
-          Paragraph('Temperature and sampling', STYLES['Heading4']),
-          _table(temps, [44*mm, 16*mm, 16*mm, 16*mm, 20*mm, 20*mm, 25*mm, 25*mm], 6.8), Spacer(1, 4*mm),
-          Paragraph('Rendering by profile', STYLES['Heading4']),
-          _table(comp, [40*mm, 38*mm, 15*mm, 15*mm, 15*mm, 39*mm, 20*mm], 6.8),
-          small('Analysed hours count only time at or above 60 °C without recording gaps; cooler time does not add to rendering.')]
+          KeepTogether([Paragraph('Temperature and sampling', STYLES['Heading4']),
+                        _table(temps, [44*mm, 16*mm, 16*mm, 16*mm, 20*mm, 20*mm, 25*mm, 25*mm], 6.8)]), Spacer(1, 4*mm),
+          KeepTogether([Paragraph('Rendering by profile', STYLES['Heading4']),
+                        _table(comp, [40*mm, 38*mm, 15*mm, 15*mm, 15*mm, 39*mm, 20*mm], 6.8),
+                        small('Analysed hours count only time at or above 60 °C without recording gaps; cooler time does not add to rendering.')])]
+    accumulated = []
+    for label, item in meat_results.items():
+        timeline = item['result'].timeline
+        if timeline.empty:
+            continue
+        first = pd.DataFrame({'t': [timeline['Timestamp'].iloc[0]], 'pct': [0.0]})
+        rest = pd.DataFrame({'t': timeline['Next timestamp'], 'pct': timeline['Accumulated rendering'] * 100})
+        accumulated.append((_stage(label, item['result']), pd.concat([first, rest], ignore_index=True), 't', 'pct'))
+    if accumulated:
+        s += [CondPageBreak(95*mm), Spacer(1, 3*mm),
+              _chart(accumulated, 'Accumulated rendering over time', master_start, transfer_time, unit='%', band=(95, 105, 'Ideal (95-105 %)'))]
 
     # ---- Environment ----------------------------------------------------------
     s += [CondPageBreak(70*mm), section('Environment')]
@@ -252,9 +359,9 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
         br = [['Phase', 'Band', 'Temperature range', 'Duration h', 'Rate/h', 'Contribution']] + [
             [x['Phase'], x['Band'], x['Temperature range'], f"{x['Duration hours']:.3f}", f"{x['Rate per hour']:.1%}", f"{x['Tenderness contribution']:.1%}"]
             for _, x in bands.iterrows()]
-        s += [CondPageBreak(150*mm), section(name),
-              _table(metrics, [30*mm, 61*mm, 30*mm, 61*mm]), Spacer(1, 3*mm),
-              _chart([(name, item['valid'], 'timestamp', 'temperature_c')], f'Temperature profile - {name}', master_start, transfer_time)]
+        # The location's temperature curve is already on page 1; this section adds the numbers behind it.
+        s += [CondPageBreak(90*mm), section(name),
+              _table(metrics, [30*mm, 61*mm, 30*mm, 61*mm]), Spacer(1, 3*mm)]
         if not bands.empty:
             s += [KeepTogether([Paragraph(f'Rendering band calculation - {name}', STYLES['Heading4']),
                                 _table(br, [30*mm, 14*mm, 50*mm, 26*mm, 26*mm, 36*mm], 6.8)])]
@@ -274,10 +381,7 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
           Spacer(1, 2*mm),
           small('All charts use one master session timeline from the earliest reading of any stream. The transfer marker shows the '
                 'derived smoker-to-hold boundary. Missing values are not interpolated across the transfer.'),
-          section('Configuration'),
-          _table(config_rows, [52*mm, 62*mm, 68*mm]), Spacer(1, 3*mm),
-          _table([['Master timeline start', _text(master_start)], ['Derived smoker-to-hold boundary', _text(transfer_time)]],
-                 [72*mm, 110*mm], header=False)]
+          KeepTogether([section('Configuration'), _table(config_rows, [52*mm, 62*mm, 68*mm])])]
 
     doc.build(s, onFirstPage=_footer, onLaterPages=_footer)
     return out.getvalue()

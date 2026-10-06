@@ -15,7 +15,7 @@ import pit_engine as pit
 from pdf_report import build_pdf_report
 
 APP_NAME = "Brisket Tenderness Analyzer"
-APP_VERSION = "2.8.2"
+APP_VERSION = "2.8.3"
 POINT = pit.POINT
 FLAT = pit.FLAT
 COOK_PID = pit.COOK_PID
@@ -23,6 +23,16 @@ COOK_GRATE = pit.COOK_GRATE
 HOLD_ENV = pit.HOLD_ENV
 IGNORE = pit.IGNORE
 MEAT_ROLES = {POINT, FLAT}
+# One colour per entity, used by every chart (categorical order validated for colour-blind separation).
+SERIES_COLOURS = {
+    "point": "#2a78d6",   # Brisket - Point
+    "flat": "#eb6834",    # Brisket - Flat
+    "pid": "#1baf7a",     # Cook Environment - PID
+    "grate": "#eda100",   # Cook Environment - Grate
+    "hold": "#e87ba4",    # Hold Environment
+}
+PHASE_COLOURS = {"Cook": "#e34948", "Hold": "#4a3aa7"}
+MARKER_COLOUR = "#52514e"
 SPREAD_WARNING = 0.25  # Point/Flat totals this far apart (25 points) get a note even within one assessment band
 ENVIRONMENT_ROLES = {COOK_PID, COOK_GRATE, HOLD_ENV}
 
@@ -197,8 +207,8 @@ def add_transfer_marker(figure, transfer_time, master_start):
     if transfer_time is None or master_start is None:
         return figure
     x = (pd.Timestamp(transfer_time) - pd.Timestamp(master_start)).total_seconds() / 3600
-    figure.add_vline(x=x, line_width=2, line_dash="dash", line_color="#A94722")
-    figure.add_annotation(x=x, y=1, yref="paper", text="Smoker to hold", showarrow=False, xanchor="left", font={"color": "#A94722"})
+    figure.add_vline(x=x, line_width=1.5, line_dash="dash", line_color=MARKER_COLOUR)
+    figure.add_annotation(x=x, y=1, yref="paper", yanchor="bottom", text="Smoker to hold", showarrow=False, xanchor="left", xshift=4, font={"color": MARKER_COLOUR, "size": 12})
     return figure
 
 
@@ -216,6 +226,105 @@ def duration_hours(frame):
     if frame is None or len(frame) < 2:
         return 0.0
     return max((frame["timestamp"].iloc[-1] - frame["timestamp"].iloc[0]).total_seconds() / 3600, 0.0)
+
+
+def plain_role(label):
+    """'🥩 Brisket - Point — Point' -> 'Brisket - Point'."""
+    text = str(label).split(" — ", 1)[0]
+    for icon in ("🥩", "🔥", "🌡", "♨", "🚫"):
+        text = text.replace(icon, "")
+    return text.strip()
+
+
+def series_colour(name):
+    """One fixed colour per entity in every chart, so Point is always the same blue."""
+    text = str(name).lower()
+    for key, colour in SERIES_COLOURS.items():
+        if key in text:
+            return colour
+    return "#52514e"
+
+
+def break_gaps(frame, max_gap_seconds, x_col="Elapsed session hours"):
+    """Insert an empty point inside every recording gap so chart lines stop there instead of bridging it."""
+    if frame.empty or max_gap_seconds is None:
+        return frame
+    frame = frame.sort_values(x_col).reset_index(drop=True)
+    gaps = frame[x_col].diff() * 3600 > max_gap_seconds
+    if not gaps.any():
+        return frame
+    breaks = frame.loc[gaps, [x_col]].copy()
+    breaks[x_col] = breaks[x_col] - 1e-6
+    return pd.concat([frame, breaks], ignore_index=True).sort_values(x_col, kind="stable").reset_index(drop=True)
+
+
+def style_figure(figure, unit, hover="x unified"):
+    """Shared look: recessive grid, legend above the plot, readable hover."""
+    figure.update_layout(
+        hovermode=hover,
+        legend={"orientation": "h", "yanchor": "bottom", "y": 1.02, "xanchor": "left", "x": 0, "title": None},
+        title={"x": 0, "xanchor": "left", "y": 0.98, "yanchor": "top", "pad": {"b": 30}},
+        margin={"t": 96, "l": 8, "r": 8, "b": 8},
+    )
+    figure.update_traces(line={"width": 2}, selector={"type": "scatter"})
+    figure.update_xaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)", zeroline=False, automargin=True)
+    figure.update_yaxes(showgrid=True, gridcolor="rgba(128,128,128,0.15)", zeroline=False, automargin=True, ticksuffix=f" {unit}" if unit == "%" else "")
+    return figure
+
+
+def accumulated_frame(result, master_start):
+    """Accumulated rendering (%) at the end of every interval, starting from 0 %. Gaps stay empty."""
+    timeline = result.timeline
+    if timeline.empty:
+        return pd.DataFrame(columns=["Elapsed session hours", "Accumulated %"])
+    start = pd.Timestamp(master_start)
+    points = [{"Elapsed session hours": (pd.Timestamp(timeline["Timestamp"].iloc[0]) - start).total_seconds() / 3600, "Accumulated %": 0.0}]
+    for _, row in timeline.iterrows():
+        end_hours = (pd.Timestamp(row["Next timestamp"]) - start).total_seconds() / 3600
+        if str(row["Status"]).startswith("Excluded"):
+            points.append({"Elapsed session hours": end_hours - 1e-6, "Accumulated %": None})
+        points.append({"Elapsed session hours": end_hours, "Accumulated %": row["Accumulated rendering"] * 100})
+    return pd.DataFrame(points)
+
+
+def crossing_time(result, target):
+    """When accumulated rendering first reached target (a fraction), interpolated within the interval."""
+    previous = 0.0
+    for _, row in result.timeline.iterrows():
+        current = row["Accumulated rendering"]
+        if current >= target and row["Incremental rendering"] > 0:
+            share = (target - previous) / row["Incremental rendering"]
+            return pd.Timestamp(row["Timestamp"]) + pd.Timedelta(seconds=row["Elapsed seconds"] * share)
+        previous = current
+    return None
+
+
+def milestone_text(result, master_start, transfer_time):
+    """One line: when the ideal range was entered and left, and in which phase."""
+    def when(moment):
+        hours = (moment - pd.Timestamp(master_start)).total_seconds() / 3600
+        phase = ""
+        if transfer_time is not None:
+            phase = " during the cook" if moment < pd.Timestamp(transfer_time) else " during the hold"
+        return f"{hours:.1f} h ({moment:%d/%m %H:%M}){phase}"
+    entered, left = crossing_time(result, 0.95), crossing_time(result, 1.05)
+    final = f"ended at {result.total:.1%}"
+    if entered is None:
+        return f"did not reach the ideal range; {final}."
+    if left is None:
+        return f"reached the ideal range (95 %) at {when(entered)} and {final}."
+    return f"reached the ideal range (95 %) at {when(entered)}, passed 105 % at {when(left)}, and {final}."
+
+
+def band_frame(result):
+    """Rendering contribution per temperature band and phase, for the band breakdown chart."""
+    summary = result.summary[result.summary["Duration hours"] > 0].copy()
+    if summary.empty:
+        return summary
+    summary["Phase"] = summary["Phase"].replace({"Hold / cooldown": "Hold"})
+    summary["Contribution %"] = summary["Tenderness contribution"] * 100
+    summary["Temperature range"] = summary["Temperature range"].str.replace("°C", " °C", regex=False)
+    return summary.sort_values(["Band", "Phase"])
 
 
 def environment_integrity_rows(environment_results):
@@ -438,8 +547,8 @@ for _, row in classifications.iterrows():
         file_name = primary_name if row["File"] == "Primary" else secondary_name
         config.append({"Role": role, "Source": display_source(f"{row['File']} / {shown}"), "File name": file_name})
 st.subheader("Detected configuration")
-st.dataframe(pd.DataFrame(config), hide_index=True, use_container_width=True)
-if st.button("Analyse session", type="primary", use_container_width=True):
+html_table(config)
+if st.button("Analyse session", type="primary", width="stretch"):
     st.session_state.analysed = True
     st.session_state.analysed_files = files_key
 if not st.session_state.get("analysed"):
@@ -542,45 +651,85 @@ rows, frames = [], []
 for label, item in meat_results.items():
     result = item["result"]
     display_label = stage_display_label(label, result)
-    rows.append({"Profile": display_label, "Source": item["source"], "Cook contribution": f"{result.cook:.1%}", "Hold contribution": f"{result.hold:.1%}", "Recorded total": f"{result.total:.1%}", "Assessment": result.assessment if result.complete else "Partial session", "Analysed hours": round(result.analysed_hours, 2)})
-    frame = elapsed_frame(item["valid"], master_start)
+    rows.append({"Profile": display_label, "Source": item["source"], "Cook": f"{result.cook:.1%}", "Hold": f"{result.hold:.1%}", "Total": f"{result.total:.1%}", "Assessment": result.assessment if result.complete else "Partial session", "Analysed h (≥ 60 °C)": f"{result.analysed_hours:.2f}"})
+    frame = break_gaps(elapsed_frame(item["valid"], master_start), item["sample"]["threshold"])
     frame["Profile"] = display_label
     frames.append(frame)
-st.dataframe(pd.DataFrame(rows), hide_index=True, use_container_width=True)
+html_table(rows, numeric=("Cook", "Hold", "Total", "Analysed h (≥ 60 °C)"))
 combined = pd.concat(frames, ignore_index=True)
-probe_figure = px.line(combined, x="Elapsed session hours", y="temperature_c", color="Profile", title="Brisket Point and Flat temperature profiles", labels={"Elapsed session hours": "Elapsed time from master session start (hours)", "temperature_c": "Temperature °C"})
-probe_figure = add_transfer_marker(probe_figure, transfer_time, master_start)
-st.plotly_chart(probe_figure, use_container_width=True, key="brisket_comparison")
+probe_figure = px.line(
+    combined, x="Elapsed session hours", y="temperature_c", color="Profile",
+    color_discrete_map={name: series_colour(name) for name in combined["Profile"].unique()},
+    title="Brisket Point and Flat temperature profiles",
+    labels={"Elapsed session hours": "Elapsed time from session start (hours)", "temperature_c": "Temperature (°C)", "Profile": ""},
+)
+probe_figure = style_figure(add_transfer_marker(probe_figure, transfer_time, master_start), "°C")
+st.plotly_chart(probe_figure, width="stretch", key="brisket_comparison")
 
 if environment_results:
     st.header("Environment analysis")
     env_rows, env_frames = [], []
     for label, result in environment_results.items():
         stage = "Hold" if result.role == HOLD_ENV else "Cook"
-        env_rows.append({"Environment stream": label.split(" — ", 1)[0].replace("🔥 ", "").replace("🌡 ", "").replace("♨ ", ""), "Source": environment_sources[label], "Stage": stage, "Start": result.timeline["timestamp"].min(), "End": result.timeline["timestamp"].max(), "Duration hours": round(duration_hours(result.timeline), 2), "Average °C": round(result.average, 1), "Minimum °C": round(result.minimum, 1), "Maximum °C": round(result.maximum, 1), "Stability": round(result.stability_score), "Level changes": result.level_changes})
-        frame = elapsed_frame(result.timeline, master_start)
-        frame["Environment stream"] = label.split(" — ", 1)[0].replace("🔥 ", "").replace("🌡 ", "").replace("♨ ", "")
+        stream_name = plain_role(label)
+        env_rows.append({"Environment stream": stream_name, "Source": environment_sources[label], "Stage": stage, "Start": f"{result.timeline['timestamp'].min():%d/%m %H:%M}", "End": f"{result.timeline['timestamp'].max():%d/%m %H:%M}", "Hours": f"{duration_hours(result.timeline):.2f}", "Avg °C": f"{result.average:.1f}", "Min °C": f"{result.minimum:.1f}", "Max °C": f"{result.maximum:.1f}", "Stability": f"{result.stability_score:.0f}/100", "Level changes": result.level_changes})
+        frame = break_gaps(elapsed_frame(result.timeline, master_start), sampling_info(result.timeline)["threshold"])
+        frame["Environment stream"] = stream_name
         env_frames.append(frame)
-    st.dataframe(pd.DataFrame(env_rows), hide_index=True, use_container_width=True)
+    html_table(env_rows, numeric=("Hours", "Avg °C", "Min °C", "Max °C", "Level changes"))
+    st.caption("Stability (0–100) is scored while the cooker holds a temperature; planned setpoint steps and the ramps between them are not counted against it.")
     env_combined = pd.concat(env_frames, ignore_index=True)
-    env_figure = px.line(env_combined, x="Elapsed session hours", y="temperature_c", color="Environment stream", title="Cook and Hold Environment profiles", labels={"Elapsed session hours": "Elapsed time from master session start (hours)", "temperature_c": "Temperature °C"})
-    env_figure = add_transfer_marker(env_figure, transfer_time, master_start)
-    st.plotly_chart(env_figure, use_container_width=True, key="environment_profiles")
+    env_figure = px.line(
+        env_combined, x="Elapsed session hours", y="temperature_c", color="Environment stream",
+        color_discrete_map={name: series_colour(name) for name in env_combined["Environment stream"].unique()},
+        title="Cook and Hold Environment profiles",
+        labels={"Elapsed session hours": "Elapsed time from session start (hours)", "temperature_c": "Temperature (°C)", "Environment stream": ""},
+    )
+    env_figure = style_figure(add_transfer_marker(env_figure, transfer_time, master_start), "°C")
+    st.plotly_chart(env_figure, width="stretch", key="environment_profiles")
 
-st.header("Brisket probe analysis")
-for index, (label, item) in enumerate(meat_results.items()):
-    result, stat = item["result"], stats[label]
-    display_label = stage_display_label(label, result)
-    with st.expander(f"{display_label} — {item['source']}", expanded=len(meat_results) == 1):
-        cols = st.columns(4)
-        cols[0].metric("Session", result.detection.session_type)
-        cols[1].metric("Cook duration", f"{stat['cook_h']:.2f} h")
-        cols[2].metric("Hold duration", f"{stat['hold_h']:.2f} h")
-        cols[3].metric("Detected pull", result.detection.pull_timestamp.strftime("%d/%m/%Y %H:%M") if result.detection.pull_timestamp is not None else "Not detected")
-        frame = elapsed_frame(item["valid"], master_start)
-        detail = px.line(frame, x="Elapsed session hours", y="temperature_c", title=display_label, labels={"Elapsed session hours": "Elapsed time from master session start (hours)", "temperature_c": "Temperature °C"})
-        detail = add_transfer_marker(detail, transfer_time, master_start)
-        st.plotly_chart(detail, use_container_width=True, key=f"temperature_{index}")
+st.header("Rendering by location")
+st.caption("How rendering built up over the session, and which temperature bands it came from. The green band is the ideal range (95–105 %).")
+accumulated = []
+for label, item in meat_results.items():
+    frame = accumulated_frame(item["result"], master_start)
+    frame["Location"] = stage_display_label(label, item["result"])
+    accumulated.append(frame)
+accumulated = pd.concat(accumulated, ignore_index=True)
+rendering_figure = px.line(
+    accumulated, x="Elapsed session hours", y="Accumulated %", color="Location",
+    color_discrete_map={name: series_colour(name) for name in accumulated["Location"].unique()},
+    title="Accumulated rendering over time",
+    labels={"Elapsed session hours": "Elapsed time from session start (hours)", "Accumulated %": "Accumulated rendering (%)", "Location": ""},
+)
+rendering_figure.add_hrect(y0=95, y1=105, fillcolor="rgba(12,163,12,0.14)", line_width=0, layer="below",
+                           annotation_text="Ideal", annotation_position="top left", annotation_font_color="#0a7a0a")
+rendering_figure = style_figure(add_transfer_marker(rendering_figure, transfer_time, master_start), "%")
+st.plotly_chart(rendering_figure, width="stretch", key="accumulated_rendering")
+for label, item in meat_results.items():
+    st.markdown(f"**{plain_role(label)}:** {milestone_text(item['result'], master_start, transfer_time)}")
+
+band_columns = st.columns(len(meat_results))
+for column, (label, item) in zip(band_columns, meat_results.items()):
+    bands = band_frame(item["result"])
+    with column:
+        if bands.empty:
+            st.info(f"{plain_role(label)}: no time at or above 60 °C.")
+            continue
+        band_figure = px.bar(
+            bands, x="Temperature range", y="Contribution %", color="Phase", barmode="stack",
+            color_discrete_map=PHASE_COLOURS, title=f"Band breakdown – {plain_role(label)}",
+            category_orders={"Temperature range": list(dict.fromkeys(bands["Temperature range"])), "Phase": list(PHASE_COLOURS)},
+            custom_data=["Duration hours", "Rate per hour"],
+            labels={"Contribution %": "Rendering (%)", "Temperature range": "", "Phase": ""},
+        )
+        band_figure.update_traces(
+            hovertemplate="%{x}<br>%{fullData.name}: %{y:.1f} %<br>%{customdata[0]:.2f} h at %{customdata[1]:.1%} per hour<extra></extra>",
+            marker_line_width=0,
+        )
+        band_figure = style_figure(band_figure, "%", hover="closest")
+        band_figure.update_layout(bargap=0.25, xaxis_tickangle=-35)
+        st.plotly_chart(band_figure, width="stretch", key=f"bands_{label}")
 
 def report_time():
     """Now in the viewer's time zone (from the browser); UTC if it is unknown."""
@@ -610,5 +759,5 @@ pdf_bytes = build_pdf_report(
     generated_at=report_time(),
 )
 report_name = f"brisket_tenderness_report_{pd.Timestamp(master_start):%Y-%m-%d}.pdf" if master_start is not None else "brisket_tenderness_report.pdf"
-report_slot.download_button("📄 Download full PDF report", data=pdf_bytes, file_name=report_name, mime="application/pdf", type="primary", use_container_width=True, on_click="ignore")
+report_slot.download_button("📄 Download full PDF report", data=pdf_bytes, file_name=report_name, mime="application/pdf", type="primary", width="stretch", on_click="ignore")
 st.caption("All charts use one master session timeline. Cook Environment streams are evaluated before the transfer boundary, Hold Environment streams after it, and missing values are not interpolated across transfer.")

@@ -2,7 +2,6 @@ from __future__ import annotations
 from dataclasses import dataclass
 from io import BytesIO
 from pathlib import Path
-import re
 import numpy as np
 import pandas as pd
 

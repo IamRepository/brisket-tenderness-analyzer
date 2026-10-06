@@ -197,26 +197,3 @@ def analyse(prepared: pd.DataFrame, role: str) -> PitResult:
         level_changes=level_changes,
         steady_share=steady_share,
     )
-
-
-def align(meat_timeline: pd.DataFrame, environment_results: dict[str, PitResult]) -> pd.DataFrame:
-    overlay = (
-        meat_timeline[["Timestamp", "Temperature °C"]]
-        .rename(columns={"Timestamp": "timestamp", "Temperature °C": "Meat temperature"})
-        .sort_values("timestamp")
-    )
-
-    for label, result in environment_results.items():
-        stream = result.timeline.rename(columns={"temperature_c": label}).sort_values("timestamp")
-        intervals = stream["timestamp"].diff().dt.total_seconds().dropna()
-        intervals = intervals[intervals > 0]
-        tolerance = max(float(intervals.median()) * 2, 60.0) if not intervals.empty else 60.0
-        overlay = pd.merge_asof(
-            overlay.sort_values("timestamp"),
-            stream[["timestamp", label]],
-            on="timestamp",
-            direction="nearest",
-            tolerance=pd.Timedelta(seconds=tolerance),
-        )
-
-    return overlay
