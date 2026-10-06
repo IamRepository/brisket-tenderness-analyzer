@@ -1,5 +1,6 @@
 from __future__ import annotations
 
+from html import escape
 from io import BytesIO
 import re
 
@@ -11,7 +12,8 @@ import brisket_engine as engine
 import pit_engine as pit
 from pdf_report import build_pdf_report
 
-APP_VERSION = "2.8.0"
+APP_NAME = "Brisket Tenderness Analyzer"
+APP_VERSION = "2.8.1"
 POINT = pit.POINT
 FLAT = pit.FLAT
 COOK_PID = pit.COOK_PID
@@ -21,18 +23,63 @@ IGNORE = pit.IGNORE
 MEAT_ROLES = {POINT, FLAT}
 ENVIRONMENT_ROLES = {COOK_PID, COOK_GRATE, HOLD_ENV}
 
-st.set_page_config(page_title=f"Brisket Session Analyser {APP_VERSION}", page_icon="🔥", layout="wide")
-st.title(f"🔥 Brisket Session Analyser {APP_VERSION}")
+st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="🔥", layout="wide")
+st.title(f"🔥 {APP_NAME} {APP_VERSION}")
 st.caption("Independent implementation based on brisket time-temperature and hot-hold concepts shared by Steve Gow. Results are analytical estimates.")
 
-with st.sidebar:
-    st.header("Settings")
-    with st.expander("Advanced sampling settings"):
-        override_gap = st.checkbox("Override automatic gap detection", value=False)
-        manual_gap = st.number_input("Maximum accepted gap (seconds)", 1.0, 86400.0, 10.0, 1.0) if override_gap else None
-    st.divider()
-    report_slot = st.empty()
-    report_slot.caption("Run an analysis to enable the full PDF report.")
+# Filled with the PDF download button once an analysis has run.
+report_slot = st.empty()
+
+# The sampling settings are drawn under the session summary, but the analysis
+# needs their values first, so read them from the previous run's widget state.
+override_gap = st.session_state.get("override_gap", False)
+manual_gap = st.session_state.get("manual_gap_seconds", 10.0) if override_gap else None
+
+TABLE_CSS = """
+<style>
+.bta-wrap {width:100%; overflow-x:auto; margin:0.25rem 0 1rem 0;}
+.bta-table {width:100%; border-collapse:collapse; table-layout:auto; font-size:0.85rem;}
+.bta-table th, .bta-table td {border:1px solid rgba(128,128,128,0.25); padding:6px 8px; vertical-align:middle; word-break:normal; overflow-wrap:normal;}
+.bta-table th {background:rgba(128,128,128,0.10); font-weight:600; text-align:left;}
+.bta-table.centred th, .bta-table.centred td {text-align:center;}
+.bta-table td.num {text-align:right; white-space:nowrap;}
+.bta-cards {display:flex; gap:1rem; flex-wrap:wrap; margin:0.25rem 0 0.5rem 0;}
+.bta-card {flex:1 1 200px; border:1px solid rgba(128,128,128,0.25); border-radius:10px; padding:12px 16px;}
+.bta-card .label {font-size:0.85rem; opacity:0.75;}
+.bta-card .value {font-size:1.6rem; font-weight:600; line-height:1.25; margin-top:4px;}
+.bta-card .value.text {font-size:1.15rem; overflow-wrap:break-word;}
+</style>
+"""
+st.markdown(TABLE_CSS, unsafe_allow_html=True)
+
+
+def html_table(rows, centred=False, numeric=()):
+    """A table that wraps its text to fit the page width instead of scrolling sideways."""
+    if not rows:
+        return
+    columns = list(rows[0].keys())
+    head = "".join(f"<th>{escape(str(c))}</th>" for c in columns)
+    body = ""
+    for row in rows:
+        cells = ""
+        for c in columns:
+            value = row[c]
+            text = "" if value is None or (isinstance(value, float) and pd.isna(value)) else str(value)
+            css = ' class="num"' if c in numeric and not centred else ""
+            cells += f"<td{css}>{escape(text)}</td>"
+        body += f"<tr>{cells}</tr>"
+    css_class = "bta-table centred" if centred else "bta-table"
+    st.markdown(f'<div class="bta-wrap"><table class="{css_class}"><thead><tr>{head}</tr></thead><tbody>{body}</tbody></table></div>', unsafe_allow_html=True)
+
+
+def stat_cards(cards):
+    """Metric-style cards whose text wraps instead of being cut off. cards: (label, value, is_text)."""
+    html = "".join(
+        f'<div class="bta-card"><div class="label">{escape(label)}</div>'
+        f'<div class="value{" text" if is_text else ""}">{escape(str(value))}</div></div>'
+        for label, value, is_text in cards
+    )
+    st.markdown(f'<div class="bta-cards">{html}</div>', unsafe_allow_html=True)
 
 
 @st.cache_data
@@ -306,15 +353,20 @@ def overall_brisket_assessment(canonical_results):
 
 # Step 1
 st.header("Step 1: Upload temperature files")
-primary = st.file_uploader("Primary temperature file", type=["xlsx", "xlsm", "xls", "csv"], key="primary")
-secondary = st.file_uploader("Secondary temperature file (optional)", type=["xlsx", "xlsm", "xls", "csv"], key="secondary")
+upload_left, upload_right = st.columns(2)
+primary = upload_left.file_uploader("Primary temperature file", type=["xlsx", "xlsm", "xls", "csv"], key="primary")
+secondary = upload_right.file_uploader("Secondary temperature file (optional)", type=["xlsx", "xlsm", "xls", "csv"], key="secondary")
+# Results stay on screen once analysed; a new set of files starts over.
+files_key = (primary.file_id if primary else None, secondary.file_id if secondary else None)
+if st.session_state.get("analysed_files") != files_key:
+    st.session_state.analysed = False
 if primary is None:
     st.info("Upload a primary temperature file to begin.")
     st.stop()
 try:
     primary_name = primary.name
     sheets = load_file(primary.getvalue(), primary.name)
-    primary_sheet = st.selectbox("Primary worksheet", list(sheets), key="primary_sheet")
+    primary_sheet = upload_left.selectbox("Primary worksheet", list(sheets), key="primary_sheet")
     primary_df = sheets[primary_sheet]
     primary_time, _ = engine.detect_columns(primary_df)
     classifications = pit.classify_columns(primary_df, primary_time)
@@ -323,7 +375,7 @@ try:
     if secondary is not None:
         secondary_name = secondary.name
         sheets2 = load_file(secondary.getvalue(), secondary.name)
-        secondary_sheet = st.selectbox("Secondary worksheet", list(sheets2), key="secondary_sheet")
+        secondary_sheet = upload_right.selectbox("Secondary worksheet", list(sheets2), key="secondary_sheet")
         secondary_df = sheets2[secondary_sheet]
         secondary_time, _ = engine.detect_columns(secondary_df)
         classifications2 = pit.classify_columns(secondary_df, secondary_time)
@@ -336,19 +388,21 @@ except Exception as exc:
 # Step 2
 st.header("Step 2: Assign probe and environment roles")
 roles = {}
+role_columns = dict(zip(("Primary", "Secondary"), st.columns(2)))
 for file_label, colour, icon in (("Primary", "#eaf3ff", "🟦"), ("Secondary", "#edf9ef", "🟩")):
     group = classifications[classifications["File"] == file_label]
     if group.empty:
         continue
     filename = primary_name if file_label == "Primary" else secondary_name
-    st.markdown(f'<div style="background:{colour};padding:12px 16px;border-radius:10px;border:1px solid #d8dee6"><b>{icon} {file_label.upper()} FILE</b><br><small>{filename}</small></div>', unsafe_allow_html=True)
-    for _, row in group.iterrows():
-        raw_column = row["Column"]
-        shown_column = row.get("Display column", pit.normalise_column_name(raw_column))
-        key = f"{file_label}_{raw_column}"
-        suggestion = row["Suggested role"]
-        index = pit.ROLES.index(suggestion) if suggestion in pit.ROLES else pit.ROLES.index(IGNORE)
-        roles[key] = st.selectbox(f"{shown_column} ({row['Confidence']}% suggested confidence)", pit.ROLES, index=index, key=f"role_{key}")
+    with role_columns[file_label]:
+        st.markdown(f'<div style="background:{colour};color:#172033;padding:12px 16px;border-radius:10px;border:1px solid #d8dee6;margin-bottom:8px"><b>{icon} {file_label.upper()} FILE</b><br><small>{escape(str(filename))}</small></div>', unsafe_allow_html=True)
+        for _, row in group.iterrows():
+            raw_column = row["Column"]
+            shown_column = row.get("Display column", pit.normalise_column_name(raw_column))
+            key = f"{file_label}_{raw_column}"
+            suggestion = row["Suggested role"]
+            index = pit.ROLES.index(suggestion) if suggestion in pit.ROLES else pit.ROLES.index(IGNORE)
+            roles[key] = st.selectbox(f"{shown_column} ({row['Confidence']}% suggested confidence)", pit.ROLES, index=index, key=f"role_{key}")
 
 config = []
 for _, row in classifications.iterrows():
@@ -358,7 +412,10 @@ for _, row in classifications.iterrows():
         config.append({"Role": role, "Source": display_source(f"{row['File']} / {shown}")})
 st.subheader("Detected configuration")
 st.dataframe(pd.DataFrame(config), hide_index=True, use_container_width=True)
-if not st.button("Analyse session", type="primary", use_container_width=True):
+if st.button("Analyse session", type="primary", use_container_width=True):
+    st.session_state.analysed = True
+    st.session_state.analysed_files = files_key
+if not st.session_state.get("analysed"):
     st.stop()
 
 raw_meat_results, environment_inputs, errors = {}, [], []
@@ -412,19 +469,43 @@ for label, item in meat_results.items():
     result = item["result"]
     stat = phase_stats(item["valid"], result.detection)
     stats[label] = stat
-    summary.append({"Profile": stage_display_label(label, result), "Source": item["source"], "Session type": result.detection.session_type, "Confidence": f"{result.detection.confidence}%", "Detected pull": result.detection.pull_timestamp, "Peak °C": round(result.detection.peak_temperature, 1), "Average °C": round(result.detection.average_temperature, 1), "Minimum °C": round(result.detection.minimum_temperature, 1), "Cook hours": round(stat["cook_h"], 2), "Hold hours": round(stat["hold_h"], 2), "Average cook °C": None if stat["cook_avg"] is None else round(stat["cook_avg"], 1), "Average hold °C": None if stat["hold_avg"] is None else round(stat["hold_avg"], 1), "Sampling interval": interval_text(item["sample"]["normal"]), "Gap threshold": interval_text(item["sample"]["threshold"])})
-st.dataframe(pd.DataFrame(summary), hide_index=True, use_container_width=True)
+    pull = result.detection.pull_timestamp
+    one_decimal = lambda v: "" if v is None else f"{v:.1f}"
+    summary.append({
+        "Profile": stage_display_label(label, result),
+        "Source": item["source"],
+        "Session type": result.detection.session_type,
+        "Conf.": f"{result.detection.confidence}%",
+        "Detected pull": "" if pull is None else f"{pull:%d/%m/%Y %H:%M}",
+        "Peak °C": one_decimal(result.detection.peak_temperature),
+        "Avg °C": one_decimal(result.detection.average_temperature),
+        "Min °C": one_decimal(result.detection.minimum_temperature),
+        "Cook h": f"{stat['cook_h']:.2f}",
+        "Hold h": f"{stat['hold_h']:.2f}",
+        "Avg cook °C": one_decimal(stat["cook_avg"]),
+        "Avg hold °C": one_decimal(stat["hold_avg"]),
+        "Sampling": interval_text(item["sample"]["normal"]),
+        "Gap limit": interval_text(item["sample"]["threshold"]),
+    })
+html_table(summary, numeric=("Conf.", "Peak °C", "Avg °C", "Min °C", "Cook h", "Hold h", "Avg cook °C", "Avg hold °C"))
+
+with st.expander("Advanced sampling settings"):
+    st.checkbox("Override automatic gap detection", value=False, key="override_gap")
+    if st.session_state.get("override_gap"):
+        st.number_input("Maximum accepted gap (seconds)", 1.0, 86400.0, 10.0, 1.0, key="manual_gap_seconds")
+    st.caption("Intervals longer than the gap limit are treated as recording gaps and left out of the rendering calculation. Changes apply immediately.")
 
 st.header("Environment integrity")
 integrity = environment_integrity_rows(environment_results)
-st.dataframe(pd.DataFrame(integrity), hide_index=True, use_container_width=True)
+html_table(integrity, centred=True)
 
 if overall_assessment is not None:
     st.header("Whole brisket tenderness assessment")
-    cols = st.columns(3)
-    cols[0].metric("Overall rendering", f"{overall_assessment['total']:.1%}")
-    cols[1].metric("Assessment", overall_assessment["assessment"])
-    cols[2].metric("Canonical locations", overall_assessment["locations"])
+    stat_cards([
+        ("Overall rendering", f"{overall_assessment['total']:.1%}", False),
+        ("Assessment", overall_assessment["assessment"], True),
+        ("Canonical locations", overall_assessment["locations"], False),
+    ])
     st.caption("Overall rendering is the mean of the canonical Point and Flat totals. Probes at the same location are averaged over time before rendering is calculated.")
 
 st.header("Brisket probe comparison")
@@ -487,5 +568,6 @@ pdf_bytes = build_pdf_report(
     environment_integrity=integrity,
     overall_assessment=overall_assessment,
 )
-report_slot.download_button("Download full PDF report", data=pdf_bytes, file_name="brisket_session_analysis_full_report.pdf", mime="application/pdf", use_container_width=True)
+report_name = f"brisket_tenderness_report_{pd.Timestamp(master_start):%Y-%m-%d}.pdf" if master_start is not None else "brisket_tenderness_report.pdf"
+report_slot.download_button("📄 Download full PDF report", data=pdf_bytes, file_name=report_name, mime="application/pdf", type="primary", use_container_width=True, on_click="ignore")
 st.caption("All charts use one master session timeline. Cook Environment streams are evaluated before the transfer boundary, Hold Environment streams after it, and missing values are not interpolated across transfer.")
