@@ -1,4 +1,4 @@
-# Brisket Session Analyser 2.4
+# Brisket Session Analyser 2.8
 
 ## New
 - Upload a combined meat/pit file or an optional second temperature file

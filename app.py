@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from io import BytesIO
+import re
 
 import pandas as pd
 import plotly.express as px
@@ -10,7 +11,7 @@ import brisket_engine as engine
 import pit_engine as pit
 from pdf_report import build_pdf_report
 
-APP_VERSION = "2.7.1"
+APP_VERSION = "2.8.0"
 POINT = pit.POINT
 FLAT = pit.FLAT
 COOK_PID = pit.COOK_PID
@@ -33,8 +34,6 @@ with st.sidebar:
     report_slot = st.empty()
     report_slot.caption("Run an analysis to enable the full PDF report.")
 
-source = st.segmented_control("Data source", ["Upload file", "Try reference brisket"], default="Upload file")
-
 
 @st.cache_data
 def load_file(data: bytes, name: str):
@@ -53,8 +52,9 @@ def interval_text(seconds):
 
 def display_source(value):
     text = str(value)
-    text = text.replace(" / Poin", " / Point")
-    text = text.replace(" / Enviroment", " / Environment")
+    # Correct the logger's spelling slips only as whole words, so "Point" stays "Point".
+    text = re.sub(r" / Poin\b", " / Point", text)
+    text = re.sub(r" / Enviroment\b", " / Environment", text)
     return text
 
 
@@ -216,8 +216,9 @@ def consolidate_meat_profiles(raw_results, manual_gap=None):
     """Create one continuous profile per physical brisket location.
 
     Point streams are combined only with Point streams, and Flat streams only
-    with Flat streams. When multiple probes report the same timestamp, their
-    temperatures are averaged once before rendering is calculated.
+    with Flat streams. Probes are averaged on a shared time grid even when they
+    sample at different seconds; each probe holds its latest reading only up to
+    its own gap threshold, so genuine gaps are not bridged.
     """
     consolidated = {}
     for role in (POINT, FLAT):
@@ -228,13 +229,11 @@ def consolidate_meat_profiles(raw_results, manual_gap=None):
         if not members:
             continue
 
-        frames = []
+        streams = []
         sources = []
         source_rows = valid_rows = invalid_rows = duplicate_timestamps = 0
         for _, item in members:
-            frame = item["valid"][["timestamp", "temperature_c"]].copy()
-            frame["source"] = item["source"]
-            frames.append(frame)
+            streams.append((item["valid"], item["sample"]["threshold"]))
             sources.append(item["source"])
             report = item["result"].report
             source_rows += report.source_rows
@@ -242,13 +241,9 @@ def consolidate_meat_profiles(raw_results, manual_gap=None):
             invalid_rows += report.invalid_rows
             duplicate_timestamps += report.duplicate_timestamps
 
-        stacked = pd.concat(frames, ignore_index=True)
-        canonical = (
-            stacked.groupby("timestamp", as_index=False)
-            .agg(temperature_c=("temperature_c", "mean"), contributing_probes=("temperature_c", "count"))
-            .sort_values("timestamp")
-            .reset_index(drop=True)
-        )
+        canonical = engine.combine_probes(streams)
+        if len(canonical) < 5:
+            continue
         valid = canonical[["timestamp", "temperature_c"]].copy()
         report = engine.ParseReport(
             source_rows=source_rows,
@@ -259,7 +254,15 @@ def consolidate_meat_profiles(raw_results, manual_gap=None):
             last_timestamp=valid["timestamp"].max(),
         )
         detection = engine.classify_session(valid)
-        sample = sampling_info(valid, manual_gap)
+        # The combined grid can hold readings a second apart, so its own median
+        # spacing says nothing about real gaps. Use the member probes' settings.
+        member_samples = [item["sample"] for _, item in members]
+        normals = [x["normal"] for x in member_samples if x["normal"] is not None]
+        sample = {
+            "normal": max(normals) if normals else None,
+            "threshold": max(x["threshold"] for x in member_samples),
+            "mode": member_samples[0]["mode"],
+        }
         result = engine.analyse(valid, report, detection, max_gap=sample["threshold"])
         consolidated[role] = {
             "result": result,
@@ -303,39 +306,32 @@ def overall_brisket_assessment(canonical_results):
 
 # Step 1
 st.header("Step 1: Upload temperature files")
-if source == "Try reference brisket":
-    primary_name = "Built-in reference brisket"
-    primary_df = engine.demo_data()
-    primary_time = "timestamp"
+primary = st.file_uploader("Primary temperature file", type=["xlsx", "xlsm", "xls", "csv"], key="primary")
+secondary = st.file_uploader("Secondary temperature file (optional)", type=["xlsx", "xlsm", "xls", "csv"], key="secondary")
+if primary is None:
+    st.info("Upload a primary temperature file to begin.")
+    st.stop()
+try:
+    primary_name = primary.name
+    sheets = load_file(primary.getvalue(), primary.name)
+    primary_sheet = st.selectbox("Primary worksheet", list(sheets), key="primary_sheet")
+    primary_df = sheets[primary_sheet]
+    primary_time, _ = engine.detect_columns(primary_df)
+    classifications = pit.classify_columns(primary_df, primary_time)
+    classifications["File"] = "Primary"
     secondary_name = secondary_df = secondary_time = None
-    classifications = pd.DataFrame([{"Column": "Average Probe Temperature (°C)", "Display column": "Average Probe Temperature (°C)", "Suggested role": FLAT, "Confidence": 70, "File": "Primary"}])
-else:
-    primary = st.file_uploader("Primary temperature file", type=["xlsx", "xlsm", "xls", "csv"], key="primary")
-    secondary = st.file_uploader("Secondary temperature file (optional)", type=["xlsx", "xlsm", "xls", "csv"], key="secondary")
-    if primary is None:
-        st.info("Upload a primary temperature file to begin.")
-        st.stop()
-    try:
-        primary_name = primary.name
-        sheets = load_file(primary.getvalue(), primary.name)
-        primary_sheet = st.selectbox("Primary worksheet", list(sheets), key="primary_sheet")
-        primary_df = sheets[primary_sheet]
-        primary_time, _ = engine.detect_columns(primary_df)
-        classifications = pit.classify_columns(primary_df, primary_time)
-        classifications["File"] = "Primary"
-        secondary_name = secondary_df = secondary_time = None
-        if secondary is not None:
-            secondary_name = secondary.name
-            sheets2 = load_file(secondary.getvalue(), secondary.name)
-            secondary_sheet = st.selectbox("Secondary worksheet", list(sheets2), key="secondary_sheet")
-            secondary_df = sheets2[secondary_sheet]
-            secondary_time, _ = engine.detect_columns(secondary_df)
-            classifications2 = pit.classify_columns(secondary_df, secondary_time)
-            classifications2["File"] = "Secondary"
-            classifications = pd.concat([classifications, classifications2], ignore_index=True)
-    except Exception as exc:
-        st.error(f"File setup failed: {exc}")
-        st.stop()
+    if secondary is not None:
+        secondary_name = secondary.name
+        sheets2 = load_file(secondary.getvalue(), secondary.name)
+        secondary_sheet = st.selectbox("Secondary worksheet", list(sheets2), key="secondary_sheet")
+        secondary_df = sheets2[secondary_sheet]
+        secondary_time, _ = engine.detect_columns(secondary_df)
+        classifications2 = pit.classify_columns(secondary_df, secondary_time)
+        classifications2["File"] = "Secondary"
+        classifications = pd.concat([classifications, classifications2], ignore_index=True)
+except Exception as exc:
+    st.error(f"File setup failed: {exc}")
+    st.stop()
 
 # Step 2
 st.header("Step 2: Assign probe and environment roles")
@@ -429,7 +425,7 @@ if overall_assessment is not None:
     cols[0].metric("Overall rendering", f"{overall_assessment['total']:.1%}")
     cols[1].metric("Assessment", overall_assessment["assessment"])
     cols[2].metric("Canonical locations", overall_assessment["locations"])
-    st.caption("Overall rendering is the mean of the canonical Point and Flat totals. Overlapping probes at the same location and timestamp are averaged before rendering is calculated.")
+    st.caption("Overall rendering is the mean of the canonical Point and Flat totals. Probes at the same location are averaged over time before rendering is calculated.")
 
 st.header("Brisket probe comparison")
 rows, frames = [], []

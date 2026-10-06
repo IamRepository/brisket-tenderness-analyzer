@@ -1,6 +1,5 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from datetime import datetime, timedelta
 from io import BytesIO
 from pathlib import Path
 import re
@@ -34,8 +33,13 @@ def parse_ts(s):
     return parsed
 
 def parse_temp(s):
+    """Temperatures as floats. Accepts 23.5, 23,5, '23,5 °C' and 1.023,5 / 1,023.5."""
     if pd.api.types.is_numeric_dtype(s): return pd.to_numeric(s,errors='coerce')
-    text=s.astype('string').str.replace('°C','',regex=False,case=False).str.replace('Celsius','',regex=False,case=False).str.strip()
+    text=s.astype('string').str.replace(r'°\s*C|celsius','',regex=True,case=False).str.replace(r'\s+','',regex=True)
+    comma=text.str.rfind(','); dot=text.str.rfind('.')
+    comma_decimal=(comma>dot).fillna(False)  # the last separator is the decimal mark
+    text=text.where(~comma_decimal,text.str.replace('.','',regex=False).str.replace(',','.',regex=False))
+    text=text.where(comma_decimal,text.str.replace(',','',regex=False))
     return pd.to_numeric(text,errors='coerce')
 
 def read_file(file_obj,name):
@@ -110,6 +114,26 @@ def analyse(valid,report,detection,pull_override=None,max_gap=10):
     summary=pd.DataFrame(records); cook=float(summary[summary.Phase=='Cook']['Tenderness contribution'].sum()); hold=float(summary[summary.Phase=='Hold / cooldown']['Tenderness contribution'].sum()); total=cook+hold
     return Result(summary,pd.DataFrame(rows),report,detection,gaps,gapseconds/3600,below/3600,float(seconds.sum()/3600),cook,hold,total,assess(total),mode=='Cook + Hold' and pull is not None)
 
-def demo_data():
-    start=datetime(2026,5,23); minutes=np.arange(0,23*60+1); base=np.interp(minutes/60,[0,1,2,4,6,7.5,9,10,12,16,20,22.75,23],[8,32,48,62,72,82,90,95,94,91,86,67,65.5])
-    return pd.DataFrame({'timestamp':[start+timedelta(minutes=int(m)) for m in minutes],'Average Probe Temperature (°C)':np.round(base,2)})
+def combine_probes(streams):
+    """Merge several probes at one physical location into one profile.
+
+    streams: list of (frame with timestamp and temperature_c, tolerance in seconds).
+    Every reading time of every probe becomes a point on a shared grid. At each
+    point, each probe contributes its latest reading if that reading is no older
+    than the probe's tolerance (its gap threshold); the contributions are averaged.
+    Probes that sample at different seconds are therefore averaged instead of
+    interleaved, and nothing is filled in across a gap that every probe shares.
+    Returns timestamp, temperature_c and contributing_probes.
+    """
+    prepared=[]
+    for i,(frame,tolerance) in enumerate(streams):
+        f=frame[['timestamp','temperature_c']].dropna().copy()
+        f['timestamp']=pd.to_datetime(f['timestamp']).astype('datetime64[ns]')
+        prepared.append((f.sort_values('timestamp').rename(columns={'temperature_c':f'p{i}'}),float(tolerance)))
+    if not prepared: return pd.DataFrame(columns=['timestamp','temperature_c','contributing_probes'])
+    grid=pd.DataFrame({'timestamp':pd.concat([f.timestamp for f,_ in prepared]).drop_duplicates().sort_values().reset_index(drop=True)})
+    for f,tolerance in prepared:
+        grid=pd.merge_asof(grid,f,on='timestamp',direction='backward',tolerance=pd.Timedelta(seconds=tolerance))
+    values=grid[[f'p{i}' for i in range(len(prepared))]]
+    out=pd.DataFrame({'timestamp':grid.timestamp,'temperature_c':values.mean(axis=1,skipna=True),'contributing_probes':values.notna().sum(axis=1)})
+    return out[out.contributing_probes>0].reset_index(drop=True)

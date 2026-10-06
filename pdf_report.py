@@ -109,7 +109,7 @@ def build_pdf_report(app_version,configuration,meat_results,stats,environment_re
             Spacer(1, 4*mm),
             Paragraph("Whole brisket tenderness assessment", STYLES["Section"]),
             _table(overall_rows, [86*mm, 94*mm]),
-            Paragraph("Overlapping probes at the same physical location and timestamp are averaged before rendering is calculated. Cook and Hold contributions are integrated once across the canonical Point and Flat profiles.", STYLES["Small"]),
+            Paragraph("Probes at the same physical location are averaged over time before rendering is calculated. Cook and Hold contributions are integrated once across the canonical Point and Flat profiles.", STYLES["Small"]),
         ]
     if environment_results:
         er=[['Stream','Source','Stage','Start','End','h','Avg C','Min C','Max C','Stab.']];es=[]
