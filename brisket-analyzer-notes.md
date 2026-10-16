@@ -1,15 +1,14 @@
 # Brisket Tenderness Analyzer: code notes
 
-Last updated 6 October 2026 for v2.8.3. Repo: github.com/IamRepository/brisket-tenderness-analyzer (public). Streamlit app on Streamlit Community Cloud; files are uploaded to GitHub manually through the web interface.
+Last updated 16 October 2026 (v2.8.3). Repo: github.com/IamRepository/brisket-tenderness-analyzer (public). Streamlit app on Streamlit Community Cloud, deployed from main.
 
 ## Name and release conventions
 - Product name: Brisket Tenderness Analyzer (US spelling). It replaced "Brisket Session Analyser" in v2.8.1.
-- Where the name appears: app.py (APP_NAME, used for page_title and st.title), pdf_report.py (report title, page footer), README.md title, release notes titles, the zip and its inner folder.
-- Release zip: "Brisket Tenderness Analyzer vX.Y.Z.zip", inner folder named the same, containing only the changed files.
-- Every release zip includes this file, updated for that release, at the repo root.
-- Keep files at the top level. Subfolders (such as tests/) did not survive the manual upload twice.
-- After uploading a release that changes more than app.py, reboot the app (Manage app, ⋮, Reboot app). Otherwise Streamlit can keep the previous brisket_engine.py in memory; v2.8.0 failed with AttributeError on combine_probes until a reboot.
-- Only the newest RELEASE_NOTES file is kept in the repo; this file's History section is the long-term record.
+- Where the name appears: app.py (APP_NAME, used for page_title and st.title), pdf_report.py (report title, page footer), README.md title, release notes titles.
+- Workflow (from 16 Oct 2026): Claude has write access and commits and pushes releases straight to main (the user's choice; no pull requests). A push to main goes live on Streamlit Cloud. Before pushing: run the tests and an end-to-end app run. Commit message starts with the version, e.g. "v2.8.4: ...".
+- Each release updates APP_VERSION, adds RELEASE_NOTES_vX.Y.Z.md (removing the previous one) and updates this file.
+- After a release that changes more than app.py, the user reboots the app (Manage app, ⋮, Reboot app). Otherwise Streamlit can keep the previous brisket_engine.py in memory; v2.8.0 failed with AttributeError on combine_probes until a reboot.
+- Before 16 Oct, releases were zips ("Brisket Tenderness Analyzer vX.Y.Z.zip") uploaded by hand; subfolders did not survive that upload, so files are kept at the top level.
 
 ## Files
 - app.py: whole UI and orchestration. Title, PDF button slot, Step 1 uploads (two columns), Step 2 role pickers (two columns), "Analyse session" -> consolidate Point/Flat -> derive transfer -> environment segmentation -> session summary, advanced sampling settings, environment integrity, whole-brisket cards and spread note, probe comparison (table + chart), environment analysis (table + chart), Rendering by location (accumulated chart + milestone lines + band breakdown per location). All tables are html_table().
@@ -40,6 +39,9 @@ Spread note when Point and Flat assessments differ or totals differ by >= 25 poi
 - v2.8.2: cook/hold hours split at the transfer; stepped-program stability and level changes; Point/Flat spread note; PDF restructured (summary first, 9 -> 5 pages, method and assessment scale, file names, °C, readable headers, local generated time).
 - 6 Oct 2026, repo cleanup by the user: removed __pycache__, master_timeline.py, INTEGRATION.md, README_v2.6.9.txt, tests/ and old release notes.
 - v2.8.3: "Brisket probe analysis" replaced by Rendering by location (accumulated rendering chart with ideal band and milestones, band breakdown); fixed entity colours; gap-aware chart lines; PDF charts redrawn and accumulated chart added; pinned requirements, .gitignore, width="stretch", README rewritten, dead code removed, test_analyzer.py.
+
+## History addendum
+- 16 Oct 2026: Claude connected to the repo with write access; releases now pushed straight to main.
 
 ## Open issues
 1. Band rates give high totals for long holds near 90 C (test cooks score 140-170 %). Needs checking against real cooks with known outcomes; the user is to supply cook files.
