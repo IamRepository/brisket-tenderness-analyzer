@@ -6,7 +6,14 @@ Independent implementation based on brisket time-temperature and hot-hold concep
 
 ## Using it
 
-1. **Upload** a primary temperature file and, optionally, a secondary one (CSV, XLSX, XLSM or XLS). Comma or dot decimals and comma or semicolon separators all work. A typical split is the smoker log as primary and the hold-oven log as secondary.
+1. **Upload** a primary temperature file and, optionally, a secondary one (CSV, XLSX, XLSM or XLS). A typical split is the smoker log as primary and the hold-oven log as secondary. The app reads:
+   - comma or dot decimals, and comma, semicolon or tab separators, in UTF-8 or Windows encoding;
+   - ISO dates (2026-06-01), day-first dates (01.06.2026, 01/06/2026) and, when the file shows it, month-first dates;
+   - times with a time zone (+02:00, Z, CEST, CET, MESZ, MEZ, UTC), which are shown in your local time;
+   - times without a zone, read as local time in your browser's time zone; the end-of-summer-time clock change is handled;
+   - separate date and time columns, spreadsheet date-times and spreadsheet date numbers.
+
+   A note under each upload says how its times were read.
 2. **Assign roles** to each temperature column. The app suggests one from the column name:
    - **Brisket - Point** and **Brisket - Flat**: meat probes. Several probes at the same location are averaged over time.
    - **Cook Environment - PID**: the cooker's own reading (controller or cavity temperature).

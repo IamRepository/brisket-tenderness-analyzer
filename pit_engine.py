@@ -1,6 +1,7 @@
 from __future__ import annotations
 
 from dataclasses import dataclass
+import re
 
 import numpy as np
 import pandas as pd
@@ -42,8 +43,36 @@ def normalise_column_name(value: str) -> str:
     return text
 
 
+# Columns that are not temperatures at all: suggested as Ignore.
+NOT_TEMPERATURE = re.compile(
+    r"set\s*-?\s*point|target|soll|fan|lüfter|luefter|blower|damper|battery|batterie|akku"
+    r"|humidity|feuchte|volt|rssi|signal|power|leistung|%|percent|prozent|status|event|note|comment",
+    re.IGNORECASE,
+)
+
+
+def _word(pattern):
+    """Match pattern as its own word, so 'point' does not match inside 'setpoint'."""
+    return re.compile(rf"(?<![a-zäöü]){pattern}(?![a-zäöü])", re.IGNORECASE)
+
+
+POINT_NAME = _word(r"point")
+FLAT_NAME = _word(r"flat")
+HOLD_NAMES = re.compile(r"hold|holding|cvap|cambro|warming|environment|warmhalte", re.IGNORECASE)
+GRATE_NAMES = re.compile(r"grate|ambient|chamber|garraum|umgebung|rost", re.IGNORECASE)
+PIT_NAME = _word(r"pit")
+PID_NAMES = re.compile(r"cavity|controller|smoker|smoque|built-in pit|(?<![a-z])pid(?![a-z])|regler", re.IGNORECASE)
+MEAT_NAMES = re.compile(r"meat|internal|food|brisket|probe|fühler|fuehler|kern|fleisch", re.IGNORECASE)
+
+
 def classify_columns(df: pd.DataFrame, timestamp_col: str) -> pd.DataFrame:
-    """Suggest conservative semantic roles for usable temperature columns."""
+    """Suggest conservative semantic roles for usable temperature columns.
+
+    Names decide first, as whole words: setpoints, fan and battery readings are
+    suggested as Ignore; 'Point' and 'Flat' as the brisket locations; hold,
+    grate/pit/ambient and controller names as environments. Unnamed columns
+    fall back to the shape of their readings.
+    """
     rows = []
 
     for column in df.columns:
@@ -56,32 +85,25 @@ def classify_columns(df: pd.DataFrame, timestamp_col: str) -> pd.DataFrame:
             continue
 
         display_column = normalise_column_name(column)
-        name = display_column.lower()
+        name = display_column
 
-        if "point" in name:
+        if NOT_TEMPERATURE.search(name):
+            role, confidence = IGNORE, 90
+        elif POINT_NAME.search(name):
             role, confidence = POINT, 95
-        elif "flat" in name:
+        elif FLAT_NAME.search(name):
             role, confidence = FLAT, 95
-        elif any(hint in name for hint in (
-            "hold environment", "hold probe", "holding probe",
-            "holding oven", "oven probe", "hold oven", "cvap",
-            "holding cabinet", "environment",
-        )):
+        elif HOLD_NAMES.search(name):
             role, confidence = HOLD_ENV, 94
-        elif any(hint in name for hint in (
-            "grate", "ambient", "pit probe", "chamber probe",
-        )):
+        elif GRATE_NAMES.search(name) or PIT_NAME.search(name):
             role, confidence = COOK_GRATE, 93
-        elif any(hint in name for hint in (
-            "cavity temperature", "controller", "smoker", "smoque",
-            "built-in pit", "pid",
-        )):
+        elif PID_NAMES.search(name):
             role, confidence = COOK_PID, 92
-        elif any(hint in name for hint in (
-            "meat", "internal", "food", "brisket", "probe",
-        )):
+        elif MEAT_NAMES.search(name):
             # Generic probe headings cannot establish Point versus Flat.
             role, confidence = FLAT, 65
+        elif valid.max() > 150 or valid.min() < -20:
+            role, confidence = IGNORE, 60
         else:
             window = min(21, max(3, len(valid) // 50))
             smooth = valid.rolling(window, center=True, min_periods=1).median()
@@ -103,12 +125,12 @@ def classify_columns(df: pd.DataFrame, timestamp_col: str) -> pd.DataFrame:
             "Confidence": confidence,
         })
 
-    return pd.DataFrame(rows)
+    return pd.DataFrame(rows, columns=["Column", "Display column", "Suggested role", "Confidence"])
 
 
-def prepare(df: pd.DataFrame, timestamp_col: str, temp_col: str) -> pd.DataFrame:
+def prepare(df: pd.DataFrame, timestamp_col: str, temp_col: str, tz: str = meat.LOCAL_TZ) -> pd.DataFrame:
     prepared = pd.DataFrame({
-        "timestamp": meat.parse_ts(df[timestamp_col]),
+        "timestamp": meat.parse_ts(df[timestamp_col], tz),
         "temperature_c": meat.parse_temp(df[temp_col]),
     }).dropna()
     prepared = prepared[prepared["temperature_c"].between(-20, 400)]

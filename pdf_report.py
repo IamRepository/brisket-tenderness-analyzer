@@ -1,6 +1,7 @@
 from __future__ import annotations
 from datetime import datetime
 from io import BytesIO
+from xml.sax.saxutils import escape as xml_escape
 import pandas as pd
 from reportlab.lib import colors
 from reportlab.lib.pagesizes import A4
@@ -14,12 +15,21 @@ DARK=colors.HexColor('#27343B'); ACCENT=colors.HexColor('#A94722'); LIGHT=colors
 PALETTE=[colors.HexColor(x) for x in ('#C6532B','#2F6B9A','#5B7F4B','#8A5A9B','#C18B2F')]; CONTENT=A4[0]-28*mm
 STYLES=getSampleStyleSheet();STYLES.add(ParagraphStyle(name='ReportTitle',parent=STYLES['Title'],fontSize=21,leading=25,textColor=DARK));STYLES.add(ParagraphStyle(name='Section',parent=STYLES['Heading2'],fontSize=14,leading=17,textColor=ACCENT,spaceBefore=8,spaceAfter=6));STYLES.add(ParagraphStyle(name='Small',parent=STYLES['BodyText'],fontSize=7.4,leading=9));STYLES.add(ParagraphStyle(name='Cell',parent=STYLES['BodyText'],fontSize=7.1,leading=8.6));STYLES.add(ParagraphStyle(name='HeadCell',parent=STYLES['Cell'],fontName='Helvetica-Bold',textColor=colors.white));STYLES.add(ParagraphStyle(name='CellC',parent=STYLES['Cell'],alignment=1));STYLES.add(ParagraphStyle(name='HeadCellC',parent=STYLES['HeadCell'],alignment=1));STYLES.add(ParagraphStyle(name='Callout',parent=STYLES['BodyText'],fontSize=8.6,leading=11,textColor=colors.HexColor('#5A3A00')))
 
+class Markup(str):
+    """Text that already contains ReportLab markup (e.g. <b>); passed through unescaped."""
+
+
 def _text(v):
+    """Plain display text (no escaping; see _cell for table cells)."""
     if v is None or (isinstance(v,float) and pd.isna(v)):return 'N/A'
     if isinstance(v,pd.Timestamp):return v.strftime('%d/%m/%Y %H:%M:%S')
     t=str(v)
     for x in ('🥩','🔥','🌡','♨','🚫','🟦','🟩'):t=t.replace(x,'')
     return t.strip()
+
+def _cell(v):
+    """Table-cell text for a Paragraph: names from files are escaped so &, < and > can never act as markup."""
+    return str(v) if isinstance(v,Markup) else xml_escape(_text(v))
 
 def _temp(v):return 'N/A' if v is None or pd.isna(v) else f'{float(v):.1f}'
 def _short(v):
@@ -53,7 +63,7 @@ def _cell_style(header_row,column,centre):
     return STYLES[name]
 
 def _table(rows,widths,size=7.1,header=True,centre=()):
-    t=Table([[Paragraph(_text(x),_cell_style(header and i==0,j,centre)) for j,x in enumerate(row)] for i,row in enumerate(rows)],colWidths=widths,repeatRows=1 if header else 0,splitByRow=1,hAlign='LEFT')
+    t=Table([[Paragraph(_cell(x),_cell_style(header and i==0,j,centre)) for j,x in enumerate(row)] for i,row in enumerate(rows)],colWidths=widths,repeatRows=1 if header else 0,splitByRow=1,hAlign='LEFT')
     cmd=[('GRID',(0,0),(-1,-1),.35,GRID),('VALIGN',(0,0),(-1,-1),'MIDDLE'),('LEFTPADDING',(0,0),(-1,-1),4),('RIGHTPADDING',(0,0),(-1,-1),4),('TOPPADDING',(0,0),(-1,-1),3),('BOTTOMPADDING',(0,0),(-1,-1),3)]
     if header:cmd += [('BACKGROUND',(0,0),(-1,0),DARK),('TEXTCOLOR',(0,0),(-1,0),colors.white),('FONTNAME',(0,0),(-1,0),'Helvetica-Bold'),('ROWBACKGROUNDS',(0,1),(-1,-1),[colors.white,LIGHT])]
     t.setStyle(TableStyle(cmd));return t
@@ -253,7 +263,7 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
         results.append([_short(label), _pct(r.cook), _pct(r.hold), _pct(r.total), r.assessment if r.complete else 'Partial session'])
     if overall_assessment:
         whole = 'Whole brisket (mean of Point and Flat)' if overall_assessment['locations'] > 1 else 'Whole brisket'
-        results.append([f'<b>{whole}</b>', '', '', f"<b>{_pct(overall_assessment['total'])}</b>", f"<b>{overall_assessment['assessment']}</b>"])
+        results.append([Markup(f'<b>{whole}</b>'), '', '', Markup(f"<b>{_pct(overall_assessment['total'])}</b>"), Markup(f"<b>{xml_escape(overall_assessment['assessment'])}</b>")])
     summary_table = _table(results, [52*mm, 20*mm, 20*mm, 20*mm, 70*mm])
     if overall_assessment and len(results) > 2:
         summary_table.setStyle(TableStyle([('LINEABOVE', (0, -1), (-1, -1), 0.9, DARK)]))

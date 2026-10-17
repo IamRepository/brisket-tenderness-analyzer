@@ -1,6 +1,6 @@
 from __future__ import annotations
 
-from datetime import datetime, timezone
+from datetime import datetime
 from html import escape
 from io import BytesIO
 import re
@@ -15,7 +15,7 @@ import pit_engine as pit
 from pdf_report import build_pdf_report
 
 APP_NAME = "Brisket Tenderness Analyzer"
-APP_VERSION = "2.8.3"
+APP_VERSION = "2.8.4"
 POINT = pit.POINT
 FLAT = pit.FLAT
 COOK_PID = pit.COOK_PID
@@ -33,6 +33,7 @@ SERIES_COLOURS = {
 }
 PHASE_COLOURS = {"Cook": "#e34948", "Hold": "#4a3aa7"}
 MARKER_COLOUR = "#52514e"
+MAX_PLAUSIBLE_SESSION_H = 72  # longer spans usually mean the dates were misread
 SPREAD_WARNING = 0.25  # Point/Flat totals this far apart (25 points) get a note even within one assessment band
 ENVIRONMENT_ROLES = {COOK_PID, COOK_GRATE, HOLD_ENV}
 
@@ -43,10 +44,30 @@ st.caption("Independent implementation based on brisket time-temperature and hot
 # Filled with the PDF download button once an analysis has run.
 report_slot = st.empty()
 
+
+def viewer_timezone():
+    """The viewer's time zone from the browser, e.g. 'Europe/Berlin'; UTC if unknown.
+
+    Logger times without a zone are read as this zone's local time, which is
+    what lets the end-of-summer-time clock change be handled correctly.
+    """
+    try:
+        zone = st.context.timezone
+        if zone:
+            ZoneInfo(zone)
+            return zone
+    except Exception:
+        pass
+    return "UTC"
+
+
+VIEW_TZ = viewer_timezone()
+
 # The sampling settings are drawn under the session summary, but the analysis
 # needs their values first, so read them from the previous run's widget state.
+# Until the number box exists the automatic limit applies, so ticking the box never zeroes the results.
 override_gap = st.session_state.get("override_gap", False)
-manual_gap = st.session_state.get("manual_gap_seconds", 10.0) if override_gap else None
+manual_gap = st.session_state.get("manual_gap_seconds") if override_gap else None
 
 TABLE_CSS = """
 <style>
@@ -95,7 +116,7 @@ def stat_cards(cards):
     st.markdown(f'<div class="bta-cards">{html}</div>', unsafe_allow_html=True)
 
 
-@st.cache_data
+@st.cache_data(max_entries=8)  # keeps a few recent uploads, not every file ever sent to the server
 def load_file(data: bytes, name: str):
     return engine.read_file(BytesIO(data), name)
 
@@ -495,9 +516,23 @@ secondary = upload_right.file_uploader("Secondary temperature file (optional)", 
 files_key = (primary.file_id if primary else None, secondary.file_id if secondary else None)
 if st.session_state.get("analysed_files") != files_key:
     st.session_state.analysed = False
+    if st.session_state.get("override_files") != files_key:
+        # A gap limit chosen for one set of files does not carry over to the next.
+        for key in ("override_gap", "manual_gap_seconds"):
+            st.session_state.pop(key, None)
+        st.session_state.override_files = files_key
+        override_gap, manual_gap = False, None
 if primary is None:
     st.info("Upload a primary temperature file to begin.")
     st.stop()
+def time_notes(frame, column):
+    """How the time column was read, for the caption under each upload."""
+    notes = engine.parse_timestamps(frame[column], VIEW_TZ)[1]
+    if column == engine.COMBINED_TIME_COLUMN:
+        notes.insert(0, "Separate date and time columns were combined.")
+    return notes
+
+
 try:
     primary_name = primary.name
     sheets = load_file(primary.getvalue(), primary.name)
@@ -506,9 +541,15 @@ try:
     primary_time, _ = engine.detect_columns(primary_df)
     classifications = pit.classify_columns(primary_df, primary_time)
     classifications["File"] = "Primary"
-    secondary_name = secondary_df = secondary_time = None
-    if secondary is not None:
-        secondary_name = secondary.name
+    for note in time_notes(primary_df, primary_time):
+        upload_left.caption(f"🕒 {note}")
+except Exception as exc:
+    st.error(f"The primary file could not be read: {exc}")
+    st.stop()
+
+secondary_name = secondary_df = secondary_time = None
+if secondary is not None:
+    try:
         sheets2 = load_file(secondary.getvalue(), secondary.name)
         secondary_sheet = upload_right.selectbox("Secondary worksheet", list(sheets2), key="secondary_sheet")
         secondary_df = sheets2[secondary_sheet]
@@ -516,8 +557,15 @@ try:
         classifications2 = pit.classify_columns(secondary_df, secondary_time)
         classifications2["File"] = "Secondary"
         classifications = pd.concat([classifications, classifications2], ignore_index=True)
-except Exception as exc:
-    st.error(f"File setup failed: {exc}")
+        secondary_name = secondary.name
+        for note in time_notes(secondary_df, secondary_time):
+            upload_right.caption(f"🕒 {note}")
+    except Exception as exc:
+        upload_right.error(f"The secondary file could not be read and is left out: {exc}")
+        secondary_df = secondary_time = None
+
+if classifications.empty:
+    st.error("No temperature columns were found in the uploaded file(s).")
     st.stop()
 
 # Step 2
@@ -565,7 +613,7 @@ for _, row in classifications.iterrows():
     active_time = primary_time if file_label == "Primary" else secondary_time
     try:
         if role in MEAT_ROLES:
-            valid, report = engine.prepare(active_df, active_time, raw_column)
+            valid, report = engine.prepare(active_df, active_time, raw_column, VIEW_TZ)
             detection = engine.classify_session(valid)
             sample = sampling_info(valid, manual_gap)
             result = engine.analyse(valid, report, detection, max_gap=sample["threshold"])
@@ -578,7 +626,10 @@ for _, row in classifications.iterrows():
 for error in errors:
     st.error(error)
 if not raw_meat_results:
-    st.error("At least one column must be classified as Brisket - Point or Brisket - Flat.")
+    if errors:
+        st.error("No brisket probe could be analysed; see the messages above.")
+    else:
+        st.error("At least one column must be classified as Brisket - Point or Brisket - Flat.")
     st.stop()
 
 meat_results = consolidate_meat_profiles(raw_meat_results, manual_gap)
@@ -587,7 +638,7 @@ meat_results = reanalyse_canonical_profiles(meat_results, transfer_time)
 overall_assessment = overall_brisket_assessment(meat_results)
 environment_results, environment_sources = {}, {}
 for item in environment_inputs:
-    prepared = pit.prepare(item["df"], item["time"], item["column"])
+    prepared = pit.prepare(item["df"], item["time"], item["column"], VIEW_TZ)
     segmented = segment_environment(prepared, item["role"], transfer_time)
     if segmented.empty:
         st.warning(f"{item['file']} / {item['shown']}: no readings overlap the applicable phase.")
@@ -624,11 +675,22 @@ for label, item in meat_results.items():
         "Gap limit": interval_text(item["sample"]["threshold"]),
     })
 html_table(summary, numeric=("Conf.", "Peak °C", "Avg °C", "Min °C", "Cook h", "Hold h", "Avg cook °C", "Avg hold °C"))
+for label, item in meat_results.items():
+    result = item["result"]
+    span_h = (item["valid"]["timestamp"].max() - item["valid"]["timestamp"].min()).total_seconds() / 3600
+    if span_h > MAX_PLAUSIBLE_SESSION_H:
+        st.warning(f"{plain_role(label)}: the readings span {span_h / 24:.1f} days. Check that the dates in the file were read correctly.")
+    if result.excluded_gaps and result.analysed_hours == 0:
+        st.warning(f"{plain_role(label)}: every interval was longer than the gap limit ({interval_text(item['sample']['threshold'])}), so no rendering was counted. Raise the limit under Advanced sampling settings, or turn the override off.")
+    elif result.excluded_gap_hours > 0.5:
+        st.caption(f"{plain_role(label)}: {result.excluded_gap_hours:.1f} h of recording gaps were left out of the rendering calculation.")
 
 with st.expander("Advanced sampling settings"):
     st.checkbox("Override automatic gap detection", value=False, key="override_gap")
     if st.session_state.get("override_gap"):
-        st.number_input("Maximum accepted gap (seconds)", 1.0, 86400.0, 10.0, 1.0, key="manual_gap_seconds")
+        automatic = max(sampling_info(item["valid"])["threshold"] for item in raw_meat_results.values())
+        st.number_input("Maximum accepted gap (seconds)", 1.0, 86400.0, float(min(max(automatic, 1.0), 86400.0)), 1.0, key="manual_gap_seconds",
+                        help="Starts at the automatic limit for these files.")
     st.caption("Intervals longer than the gap limit are treated as recording gaps and left out of the rendering calculation. Changes apply immediately.")
 
 st.header("Environment integrity")
@@ -714,7 +776,10 @@ for column, (label, item) in zip(band_columns, meat_results.items()):
     bands = band_frame(item["result"])
     with column:
         if bands.empty:
-            st.info(f"{plain_role(label)}: no time at or above 60 °C.")
+            if item["result"].excluded_gaps and item["result"].analysed_hours == 0:
+                st.info(f"{plain_role(label)}: nothing counted; every interval was excluded as a recording gap.")
+            else:
+                st.info(f"{plain_role(label)}: no time at or above 60 °C.")
             continue
         band_figure = px.bar(
             bands, x="Temperature range", y="Contribution %", color="Phase", barmode="stack",
@@ -733,13 +798,7 @@ for column, (label, item) in zip(band_columns, meat_results.items()):
 
 def report_time():
     """Now in the viewer's time zone (from the browser); UTC if it is unknown."""
-    try:
-        zone = st.context.timezone
-        if zone:
-            return datetime.now(ZoneInfo(zone))
-    except Exception:
-        pass
-    return datetime.now(timezone.utc)
+    return datetime.now(ZoneInfo(VIEW_TZ))
 
 
 cook_aggregate, hold_aggregate = build_composite_environment(environment_results)

@@ -1,6 +1,6 @@
 from __future__ import annotations
 from dataclasses import dataclass
-from io import BytesIO
+from io import BytesIO, StringIO
 from pathlib import Path
 import numpy as np
 import pandas as pd
@@ -23,51 +23,283 @@ class Result:
     excluded_gaps:int; excluded_gap_hours:float; below_model_hours:float; analysed_hours:float
     cook:float; hold:float; total:float; assessment:str; complete:bool
 
-def parse_ts(s):
-    if pd.api.types.is_datetime64_any_dtype(s): return pd.to_datetime(s,errors='coerce')
-    text=s.astype('string').str.strip().str.replace(r'\s+(CEST|CET|UTC|GMT)$','',regex=True,case=False).str.replace('T',' ',regex=False)
-    parsed=pd.to_datetime(text,errors='coerce',dayfirst=True)
-    numeric=pd.to_numeric(s,errors='coerce'); mask=parsed.isna()&numeric.between(20000,100000)
-    if mask.any(): parsed.loc[mask]=pd.to_datetime(numeric.loc[mask],unit='D',origin='1899-12-30',errors='coerce')
-    return parsed
+# ---------------------------------------------------------------------------
+# Reading timestamps
+#
+# Every timestamp leaves this section as a time-zone-aware value in one zone
+# (normally the viewer's), so files from different loggers line up and the
+# clock change at the end of summer time cannot lose or duplicate an hour.
+# ---------------------------------------------------------------------------
+LOCAL_TZ = 'Europe/Berlin'
+# Zone names some loggers append to a time, as UTC offsets.
+ZONE_WORDS = {'CEST': '+02:00', 'MESZ': '+02:00', 'CET': '+01:00', 'MEZ': '+01:00',
+              'BST': '+01:00', 'UTC': '+00:00', 'GMT': '+00:00', 'Z': '+00:00'}
+_ZONE_RE = r'\s*\b(CEST|MESZ|CET|MEZ|BST|UTC|GMT)\b\s*(?:([+-])(\d{1,2})(?::?(\d{2}))?)?$'
+_OFFSET_RE = r'(?:[+-]\d{2}:?\d{2}|Z)$'
+_ISO_RE = r'^\d{4}[-/.]\d{1,2}[-/.]\d{1,2}'
+_DMY_RE = r'^(\d{1,2})([./-])(\d{1,2})[./-](\d{2,4})'
+_TIME_ONLY_RE = r'^\d{1,2}:\d{2}(?::\d{2}(?:[.,]\d+)?)?\s*(?:[AaPp]\.?[Mm]\.?)?$'
+_DATE_ONLY_RE = r'^(?:\d{4}[-/.]\d{1,2}[-/.]\d{1,2}|\d{1,2}[./-]\d{1,2}[./-]\d{2,4})$'
+
+
+def _valid_zone(tz):
+    try:
+        from zoneinfo import ZoneInfo
+        ZoneInfo(str(tz))
+        return str(tz)
+    except Exception:
+        return 'UTC'
+
+
+def _zone_word_to_offset(text):
+    """'18:00 CEST' -> '18:00+02:00'; 'GMT+2' style suffixes become their offset."""
+    def replace(match):
+        word, sign, hours, minutes = match.group(1).upper(), match.group(2), match.group(3), match.group(4)
+        if sign:
+            return f'{sign}{int(hours):02d}:{int(minutes or 0):02d}'
+        return ZONE_WORDS[word]
+    out = text.str.replace(_ZONE_RE, replace, regex=True, case=False)
+    return out.str.replace(r'(?<=\d)\s*Z$', '+00:00', regex=True)
+
+
+def _date_order(text):
+    """Decide how to read d/m/y-style dates: 'dayfirst', 'monthfirst' or 'iso'.
+
+    A first field above 12 proves day-first, a second field above 12 proves
+    month-first. When every date fits both ways, the reading whose readings
+    follow each other most closely wins (a cook from 1 to 2 June is a day long,
+    not a month), with day-first as the tie-break.
+    """
+    sample = text.dropna()
+    if sample.empty:
+        return 'dayfirst'
+    if sample.str.match(_ISO_RE).mean() > 0.5:
+        return 'iso'
+    parts = sample.str.extract(_DMY_RE)
+    if parts[0].isna().all():
+        return 'dayfirst'
+    first, second = pd.to_numeric(parts[0], errors='coerce'), pd.to_numeric(parts[2], errors='coerce')
+    if (first > 12).any():
+        return 'dayfirst'
+    if (second > 12).any():
+        return 'monthfirst'
+    spans = {}
+    for order in ('dayfirst', 'monthfirst'):
+        parsed = _parse_text(sample, order, utc=False)
+        steps = parsed.diff().dt.total_seconds().abs()
+        spans[order] = steps.sum() if parsed.notna().mean() > 0.9 else np.inf
+    return 'monthfirst' if spans['monthfirst'] < spans['dayfirst'] else 'dayfirst'
+
+
+def _parse_text(text, order, utc):
+    """Parse strings with one consistent rule for the whole column."""
+    from pandas.tseries.api import guess_datetime_format
+    if order == 'iso':
+        return pd.to_datetime(text, format='ISO8601', errors='coerce', utc=utc)
+    dayfirst = order == 'dayfirst'
+    first = text.dropna().iloc[0] if text.notna().any() else None
+    fmt = guess_datetime_format(first, dayfirst=dayfirst) if first is not None else None
+    if fmt:
+        parsed = pd.to_datetime(text, format=fmt, errors='coerce', utc=utc)
+        if parsed.notna().sum() >= 0.98 * text.notna().sum():
+            return parsed
+    return pd.to_datetime(text, format='mixed', dayfirst=dayfirst, errors='coerce', utc=utc)
+
+
+def _localise(naive, tz, notes):
+    """Attach the local zone to wall-clock times, resolving the clock change.
+
+    In autumn the hour before 03:00 happens twice. A logger writing local time
+    then repeats 02:00-03:00; the first pass is summer time and the second is
+    winter time. They are told apart by the order of the rows in the file.
+    Times skipped in spring are moved forward.
+    """
+    if naive.isna().all():
+        return naive.dt.tz_localize(tz)
+    trial = naive.dt.tz_localize(tz, ambiguous='NaT', nonexistent='NaT')
+    unresolved = trial.isna() & naive.notna()
+    if not unresolved.any():
+        return trial
+    flags = np.zeros(len(naive), dtype=bool)
+    order = naive.to_numpy()
+    descending = (pd.Series(order).diff().dt.total_seconds() < 0).mean() > 0.5
+    positions = range(len(order) - 1, -1, -1) if descending else range(len(order))
+    summer, seen, previous = True, set(), None
+    for i in positions:
+        if not unresolved.iloc[i]:
+            continue
+        value = order[i]
+        if previous is not None and (value < previous or value in seen):
+            summer = False
+        flags[i] = summer
+        seen.add(value)
+        previous = value
+    result = naive.dt.tz_localize(tz, ambiguous=flags, nonexistent='shift_forward')
+    moment = naive[unresolved].iloc[0]
+    notes.append(f'Clock change on {moment:%d/%m/%Y} handled: readings are kept in their real order, so no hour is lost or counted twice.')
+    return result
+
+
+def parse_timestamps(s, tz=LOCAL_TZ):
+    """Timestamps as time-zone-aware values in tz, plus notes on how they were read.
+
+    Handles ISO dates (2026-06-01), day-first and month-first dates (decided
+    per column, never per value), offsets (+02:00, Z), zone names (CEST, CET,
+    MEZ, UTC), Excel serial dates and native spreadsheet date-times. Times
+    without dates roll over to the next day at midnight.
+    """
+    tz = _valid_zone(tz)
+    notes = []
+    if pd.api.types.is_datetime64_any_dtype(s):
+        parsed = pd.to_datetime(s, errors='coerce')
+        if parsed.dt.tz is not None:
+            return parsed.dt.tz_convert(tz), notes
+        return _localise(parsed, tz, notes), notes
+
+    numeric = pd.to_numeric(s, errors='coerce') if not pd.api.types.is_numeric_dtype(s) else s.astype(float)
+    if numeric.notna().mean() > 0.9 and numeric.dropna().between(20000, 100000).mean() > 0.9:
+        parsed = pd.to_datetime(numeric, unit='D', origin='1899-12-30', errors='coerce').dt.round('s')
+        notes.append('Times read as spreadsheet date numbers.')
+        return _localise(parsed, tz, notes), notes
+    if pd.api.types.is_numeric_dtype(s):
+        return pd.Series(pd.NaT, index=s.index, dtype=f'datetime64[ns, {tz}]'), notes
+
+    text = s.astype('string').str.strip().replace('', pd.NA)
+    if text.dropna().str.match(_TIME_ONLY_RE).mean() > 0.9:
+        times = pd.to_datetime(text, format='mixed', errors='coerce')
+        clock = times - times.dt.normalize()
+        rollover = (clock.diff() < -pd.Timedelta(hours=12)).cumsum()
+        base = pd.Timestamp.now(tz=tz).normalize().tz_localize(None)
+        parsed = base + clock + pd.to_timedelta(rollover, unit='D')
+        notes.append('The file has times but no dates. The first reading is placed on today\'s date and each midnight starts a new day.')
+        return _localise(parsed, tz, notes), notes
+
+    text = _zone_word_to_offset(text)
+    has_offset = text.dropna().str.contains(_OFFSET_RE, regex=True).mean() > 0.5
+    order = _date_order(text)
+    parsed = _parse_text(text, order, utc=has_offset)
+    if order == 'monthfirst':
+        notes.append('Dates read as month/day/year.')
+    if has_offset:
+        notes.append(f'Times carry a time zone and are shown in {tz}.' if tz != 'UTC' else 'Times carry a time zone and are shown in UTC.')
+        return parsed.dt.tz_convert(tz), notes
+    return _localise(parsed, tz, notes), notes
+
+
+def parse_ts(s, tz=LOCAL_TZ):
+    """Timestamps as time-zone-aware values in tz (see parse_timestamps)."""
+    return parse_timestamps(s, tz)[0]
 
 def parse_temp(s):
     """Temperatures as floats. Accepts 23.5, 23,5, '23,5 °C' and 1.023,5 / 1,023.5."""
-    if pd.api.types.is_numeric_dtype(s): return pd.to_numeric(s,errors='coerce')
+    if pd.api.types.is_numeric_dtype(s): return pd.to_numeric(s,errors='coerce').astype('float64')
     text=s.astype('string').str.replace(r'°\s*C|celsius','',regex=True,case=False).str.replace(r'\s+','',regex=True)
     comma=text.str.rfind(','); dot=text.str.rfind('.')
     comma_decimal=(comma>dot).fillna(False)  # the last separator is the decimal mark
     text=text.where(~comma_decimal,text.str.replace('.','',regex=False).str.replace(',','.',regex=False))
     text=text.where(comma_decimal,text.str.replace(',','',regex=False))
-    return pd.to_numeric(text,errors='coerce')
+    return pd.to_numeric(text,errors='coerce').astype('float64')
 
-def read_file(file_obj,name):
-    data=BytesIO(file_obj.read()); file_obj.seek(0); ext=Path(name).suffix.lower()
-    if ext=='.csv': return {'CSV':pd.read_csv(data,sep=None,engine='python')}
-    if ext in {'.xlsx','.xlsm','.xls'}: return pd.read_excel(data,sheet_name=None)
+# ---------------------------------------------------------------------------
+# Reading files
+# ---------------------------------------------------------------------------
+COMBINED_TIME_COLUMN = 'Date time (combined)'
+
+
+def _decode(raw):
+    """Text of a CSV file: UTF-8 (with or without BOM), else Windows-1252, else Latin-1."""
+    for encoding in ('utf-8-sig', 'cp1252', 'latin-1'):
+        try:
+            return raw.decode(encoding)
+        except UnicodeDecodeError:
+            continue
+    return raw.decode('latin-1', errors='replace')
+
+
+def merge_date_time_columns(df):
+    """Join a date-only column and a time-only column into one timestamp column.
+
+    Some loggers write the date and the time in separate columns. On its own the
+    time column wraps at midnight, so the two are combined first.
+    """
+    def kind(column):
+        values = df[column].dropna()
+        if values.empty:
+            return None
+        if pd.api.types.is_datetime64_any_dtype(values):
+            stamps = pd.to_datetime(values)
+            return 'date' if (stamps == stamps.dt.normalize()).all() else None
+        if values.map(lambda v: hasattr(v, 'hour') and not hasattr(v, 'year')).mean() > 0.9:
+            return 'time'
+        text = values.astype(str).str.strip()
+        if text.str.match(_TIME_ONLY_RE).mean() > 0.9:
+            return 'time'
+        if text.str.match(_DATE_ONLY_RE).mean() > 0.9:
+            return 'date'
+        return None
+    kinds = {column: kind(column) for column in df.columns}
+    dates = [c for c, k in kinds.items() if k == 'date']
+    times = [c for c, k in kinds.items() if k == 'time']
+    if not dates or not times or COMBINED_TIME_COLUMN in df.columns:
+        return df
+    date_values = df[dates[0]]
+    if pd.api.types.is_datetime64_any_dtype(date_values):
+        date_text = pd.to_datetime(date_values).dt.strftime('%Y-%m-%d')
+    else:
+        date_text = date_values.astype('string').str.strip()
+    time_text = df[times[0]].map(lambda v: v.strftime('%H:%M:%S') if hasattr(v, 'strftime') else v).astype('string').str.strip()
+    combined = df.copy()
+    combined.insert(0, COMBINED_TIME_COLUMN, date_text + ' ' + time_text)
+    return combined.drop(columns=[dates[0], times[0]])
+
+
+def read_file(file_obj, name):
+    """All sheets of an uploaded file as DataFrames, keyed by sheet name ('CSV' for a CSV file)."""
+    raw = file_obj.read(); file_obj.seek(0) if hasattr(file_obj, 'seek') else None
+    ext = Path(name).suffix.lower()
+    if ext == '.csv':
+        text = _decode(raw)
+        if not text.strip():
+            raise ValueError('the file is empty.')
+        try:
+            frame = pd.read_csv(StringIO(text), sep=None, engine='python')
+        except Exception:
+            frame = pd.read_csv(StringIO(text))
+        if frame.shape[1] < 2:
+            raise ValueError('the file needs a time column and at least one temperature column, separated by commas, semicolons or tabs.')
+        return {'CSV': merge_date_time_columns(frame)}
+    if ext in {'.xlsx', '.xlsm', '.xls'}:
+        return {sheet: merge_date_time_columns(frame) for sheet, frame in pd.read_excel(BytesIO(raw), sheet_name=None).items()}
     raise ValueError('Supported formats are XLSX, XLSM, XLS and CSV.')
 
-def detect_columns(df):
-    columns=list(df.columns); lowered={c:str(c).lower() for c in columns}
-    timestamp=next((c for c in columns if any(x in lowered[c] for x in ('timestamp','datetime','date time'))),None)
-    if timestamp is None:
-        score,timestamp=max((parse_ts(df[c].head(300)).notna().mean(),c) for c in columns)
-        if score<.25: raise ValueError('Timestamp column not detected.')
-    probes=[c for c in columns if c!=timestamp and any(x in lowered[c] for x in ('probe','meat','internal','flat','point','food','brisket')) and not any(x in lowered[c] for x in ('pit','ambient','grate','controller','target','setpoint'))]
-    if not probes:
-        scored=[]
-        for c in columns:
-            if c==timestamp: continue
-            values=parse_temp(df[c].head(300)); scored.append((values.between(-20,150).mean(),c))
-        probes=[c for score,c in sorted(scored,reverse=True) if score>=.25]
-    if not probes: raise ValueError('Meat-temperature column not detected.')
-    return timestamp,probes
 
-def prepare(df,timestamp_col,probe_col):
-    raw=pd.DataFrame({'timestamp':parse_ts(df[timestamp_col]),'temperature_c':parse_temp(df[probe_col])})
-    mask=raw.timestamp.notna()&raw.temperature_c.between(-20,150); valid=raw[mask].copy().sort_values('timestamp',kind='stable')
-    duplicates=int(valid.duplicated('timestamp',keep='last').sum()); valid=valid.drop_duplicates('timestamp',keep='last').reset_index(drop=True)
-    return valid,ParseReport(len(raw),len(valid),int((~mask).sum()),duplicates,valid.timestamp.min() if len(valid) else None,valid.timestamp.max() if len(valid) else None)
+TIME_NAMES = ('timestamp', 'datetime', 'date time', 'date/time', 'date_time', 'zeitstempel', 'datum/zeit', 'datum zeit')
+
+
+def detect_columns(df):
+    """The timestamp column and the likely meat-probe columns."""
+    columns = list(df.columns); lowered = {c: str(c).lower() for c in columns}
+    timestamp = next((c for c in columns if any(x in lowered[c] for x in TIME_NAMES)), None)
+    if timestamp is None:
+        scores = [(parse_ts(df[c].head(300)).notna().mean(), index, c) for index, c in enumerate(columns)]
+        score, _, timestamp = max(scores, key=lambda x: (x[0], -x[1]))
+        if score < .25: raise ValueError('no time column was found. The file needs a column of dates and times (or separate date and time columns).')
+    probes = [c for c in columns if c != timestamp and any(x in lowered[c] for x in ('probe', 'meat', 'internal', 'flat', 'point', 'food', 'brisket', 'kern', 'fleisch')) and not any(x in lowered[c] for x in ('pit', 'ambient', 'grate', 'controller', 'target', 'setpoint', 'set point'))]
+    if not probes:
+        scored = []
+        for c in columns:
+            if c == timestamp: continue
+            values = parse_temp(df[c].head(300)); scored.append((float(values.between(-20, 150).mean()), c))
+        probes = [c for score, c in sorted(scored, key=lambda x: -x[0]) if score >= .25]
+    if not probes: raise ValueError('no temperature column was found.')
+    return timestamp, probes
+
+
+def prepare(df, timestamp_col, probe_col, tz=LOCAL_TZ):
+    raw = pd.DataFrame({'timestamp': parse_ts(df[timestamp_col], tz), 'temperature_c': parse_temp(df[probe_col])})
+    mask = raw.timestamp.notna() & raw.temperature_c.between(-20, 150); valid = raw[mask].copy().sort_values('timestamp', kind='stable')
+    duplicates = int(valid.duplicated('timestamp', keep='last').sum()); valid = valid.drop_duplicates('timestamp', keep='last').reset_index(drop=True)
+    return valid, ParseReport(len(raw), len(valid), int((~mask).sum()), duplicates, valid.timestamp.min() if len(valid) else None, valid.timestamp.max() if len(valid) else None)
 
 def classify_session(valid):
     if len(valid)<5: raise ValueError('At least five valid readings are required.')
@@ -127,7 +359,7 @@ def combine_probes(streams):
     prepared=[]
     for i,(frame,tolerance) in enumerate(streams):
         f=frame[['timestamp','temperature_c']].dropna().copy()
-        f['timestamp']=pd.to_datetime(f['timestamp']).astype('datetime64[ns]')
+        f['timestamp']=pd.to_datetime(f['timestamp']).dt.as_unit('ns')
         prepared.append((f.sort_values('timestamp').rename(columns={'temperature_c':f'p{i}'}),float(tolerance)))
     if not prepared: return pd.DataFrame(columns=['timestamp','temperature_c','contributing_probes'])
     grid=pd.DataFrame({'timestamp':pd.concat([f.timestamp for f,_ in prepared]).drop_duplicates().sort_values().reset_index(drop=True)})
