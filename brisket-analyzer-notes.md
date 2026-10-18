@@ -1,9 +1,10 @@
 # Brisket Tenderness Analyzer: code notes
 
-Last updated 18 October 2026 for v2.8.5. Repo: github.com/IamRepository/brisket-tenderness-analyzer (public). Streamlit app on Streamlit Community Cloud, deployed from main.
+Last updated 18 October 2026 for v2.8.6. Repo: github.com/IamRepository/brisket-tenderness-analyzer (public). Streamlit app on Streamlit Community Cloud, deployed from main.
 
 ## Name and release conventions
 - Product name: Brisket Tenderness Analyzer (US spelling). It replaced "Brisket Session Analyser" in v2.8.1.
+- Logo: APP_ICON = ':material/timer:' (Google Material Symbols, chosen 18 Oct 2026 from seven options; same style as BBQ Chart to Data's ':material/dashboard:'), used as page_icon and before the title. Takes the text colour, so it follows dark mode.
 - Where the name appears: app.py (APP_NAME, used for page_title and st.title), pdf_report.py (report title, page footer), README.md title, release notes titles.
 - Workflow (from 16 Oct 2026): Claude has write access and commits and pushes releases straight to main (the user's choice; no pull requests). A push to main goes live on Streamlit Cloud. Before pushing: run the tests and an end-to-end app run. Commit message starts with the version, e.g. "v2.8.4: ...".
 - Each release updates APP_VERSION, adds RELEASE_NOTES_vX.Y.Z.md (removing the previous one) and updates this file.
@@ -53,6 +54,7 @@ Spread note when Point and Flat assessments differ or totals differ by >= 25 poi
 - 16 Oct 2026: deep audit of v2.8.3 (16 findings).
 - v2.8.4: audit fixes 1-6, 8, 12, 13, 15: ISO dates, time zones and offsets, end-of-summer-time clock change, separate date/time columns, per-column date order, Windows-encoded CSVs, role suggestions (setpoint/fan/battery ignored, Pit), gap override default, clearer errors, secondary file can't block the run, PDF text escaping, upload cache capped; 29 tests.
 - v2.8.5: dark mode toggle; vectorised rendering (24 h at 2 s: 80 s -> 2.5 s); short rests detected by time after the peak; more accurate pull; manual smoker-to-hold transfer with a hint when the cook environment stops early; the transfer splits every probe; 35 tests.
+- v2.8.6: timer logo (Material Symbols) in the title and browser tab, replacing the 🔥 emoji.
 
 ## Open issues
 1. Fahrenheit files are read as Celsius (readings above 150 dropped); no unit detection.

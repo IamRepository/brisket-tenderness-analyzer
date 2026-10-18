@@ -16,7 +16,8 @@ import pit_engine as pit
 from pdf_report import build_pdf_report
 
 APP_NAME = "Brisket Tenderness Analyzer"
-APP_VERSION = "2.8.5"
+APP_VERSION = "2.8.6"
+APP_ICON = ":material/timer:"  # Google Material Symbols "timer": time at temperature; same style as BBQ Chart to Data
 POINT = pit.POINT
 FLAT = pit.FLAT
 COOK_PID = pit.COOK_PID
@@ -46,7 +47,7 @@ MAX_PLAUSIBLE_SESSION_H = 72  # longer spans usually mean the dates were misread
 SPREAD_WARNING = 0.25  # Point/Flat totals this far apart (25 points) get a note even within one assessment band
 ENVIRONMENT_ROLES = {COOK_PID, COOK_GRATE, HOLD_ENV}
 
-st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="🔥", layout="wide")
+st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon=APP_ICON, layout="wide")
 
 
 def theme_switch():
@@ -95,7 +96,7 @@ def theme_switch():
 
 
 title_col, theme_col = st.columns([5, 1], vertical_alignment="center")
-title_col.title(f"🔥 {APP_NAME} {APP_VERSION}")
+title_col.title(f"{APP_ICON} {APP_NAME} {APP_VERSION}")
 with theme_col:
     theme_switch()
 st.caption("Independent implementation based on brisket time-temperature and hot-hold concepts shared by Steve Gow. Results are analytical estimates.")
