@@ -6,6 +6,7 @@ from io import BytesIO
 import re
 from zoneinfo import ZoneInfo
 
+import numpy as np
 import pandas as pd
 import plotly.express as px
 import streamlit as st
@@ -15,7 +16,7 @@ import pit_engine as pit
 from pdf_report import build_pdf_report
 
 APP_NAME = "Brisket Tenderness Analyzer"
-APP_VERSION = "2.8.4"
+APP_VERSION = "2.8.5"
 POINT = pit.POINT
 FLAT = pit.FLAT
 COOK_PID = pit.COOK_PID
@@ -23,22 +24,80 @@ COOK_GRATE = pit.COOK_GRATE
 HOLD_ENV = pit.HOLD_ENV
 IGNORE = pit.IGNORE
 MEAT_ROLES = {POINT, FLAT}
-# One colour per entity, used by every chart (categorical order validated for colour-blind separation).
+# The theme in use (light or dark), from the browser. Colours below have their own dark steps,
+# each set checked for colour-blind separation against its background.
+IS_DARK = getattr(getattr(st.context, "theme", None), "type", "light") == "dark"
+# One colour per entity, used by every chart.
 SERIES_COLOURS = {
-    "point": "#2a78d6",   # Brisket - Point
-    "flat": "#eb6834",    # Brisket - Flat
-    "pid": "#1baf7a",     # Cook Environment - PID
-    "grate": "#eda100",   # Cook Environment - Grate
-    "hold": "#e87ba4",    # Hold Environment
+    "point": "#3987e5" if IS_DARK else "#2a78d6",   # Brisket - Point
+    "flat": "#d95926" if IS_DARK else "#eb6834",    # Brisket - Flat
+    "pid": "#199e70" if IS_DARK else "#1baf7a",     # Cook Environment - PID
+    "grate": "#c98500" if IS_DARK else "#eda100",   # Cook Environment - Grate
+    "hold": "#d55181" if IS_DARK else "#e87ba4",    # Hold Environment
 }
-PHASE_COLOURS = {"Cook": "#e34948", "Hold": "#4a3aa7"}
-MARKER_COLOUR = "#52514e"
+PHASE_COLOURS = {"Cook": "#e66767", "Hold": "#9085e9"} if IS_DARK else {"Cook": "#e34948", "Hold": "#4a3aa7"}
+MARKER_COLOUR = "#c3c2b7" if IS_DARK else "#52514e"
+IDEAL_FILL = "rgba(12,163,12,0.24)" if IS_DARK else "rgba(12,163,12,0.14)"
+IDEAL_TEXT = "#7ad97a" if IS_DARK else "#0a7a0a"
+# Step 2 file headers: (background, border, text) per file.
+FILE_BOX = ({"Primary": ("#16263d", "#2c4a72", "#e6edf7"), "Secondary": ("#15301f", "#2b5c3c", "#e3f2e8")} if IS_DARK else
+            {"Primary": ("#eaf3ff", "#d8dee6", "#172033"), "Secondary": ("#edf9ef", "#d8dee6", "#172033")})
 MAX_PLAUSIBLE_SESSION_H = 72  # longer spans usually mean the dates were misread
 SPREAD_WARNING = 0.25  # Point/Flat totals this far apart (25 points) get a note even within one assessment band
 ENVIRONMENT_ROLES = {COOK_PID, COOK_GRATE, HOLD_ENV}
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon="🔥", layout="wide")
-st.title(f"🔥 {APP_NAME} {APP_VERSION}")
+
+
+def theme_switch():
+    """'Dark mode' switch, as in BBQ Chart to Data. Streamlit has no command to change the theme
+    from the app, so the switch uses the Light/Dark items of Streamlit's own ⋮ menu in the browser,
+    then the menu's Rerun so the app's own colours (charts, tables) follow. Nothing on the page is
+    lost. The switch follows the menu when the theme is changed there."""
+    if st.session_state.get("theme_request") is None:
+        st.session_state.dark_mode = IS_DARK
+
+    def requested():
+        st.session_state.theme_request = "Dark" if st.session_state.dark_mode else "Light"
+        st.session_state.theme_nonce = st.session_state.get("theme_nonce", 0) + 1
+
+    st.toggle(":material/dark_mode: Dark mode", key="dark_mode", on_change=requested,
+              help="Switches between the light and the dark look. The same choice is in the ⋮ menu at the "
+                   "top right, which also has \"System\" to follow your computer's setting.")
+    want = st.session_state.get("theme_request")
+    if want:
+        nonce = st.session_state.theme_nonce
+        st.html(f"""<script>
+(async () => {{
+  if (window.__btaTheme === {nonce}) return;
+  window.__btaTheme = {nonce};
+  const sleep = ms => new Promise(r => setTimeout(r, ms));
+  const item = () => document.querySelector('[data-testid="stMainMenuItem-theme-{want}"]');
+  for (let i = 0; i < 20 && !item(); i++) {{
+    const btn = document.querySelector('[data-testid="stMainMenuButton"]');
+    if (btn && i % 5 === 0) btn.click();
+    await sleep(100);
+  }}
+  if (!item()) return;
+  item().click();
+  await sleep(400);
+  const rerun = () => document.querySelector('[data-testid="stMainMenuItem-rerun"]');
+  for (let i = 0; i < 20 && !rerun(); i++) {{
+    const btn = document.querySelector('[data-testid="stMainMenuButton"]');
+    if (btn && i % 5 === 0) btn.click();
+    await sleep(100);
+  }}
+  if (rerun()) rerun().click();
+}})();
+</script>""", unsafe_allow_javascript=True)
+        if (want == "Dark") == IS_DARK:
+            st.session_state.theme_request = None  # done: the theme now matches
+
+
+title_col, theme_col = st.columns([5, 1], vertical_alignment="center")
+title_col.title(f"🔥 {APP_NAME} {APP_VERSION}")
+with theme_col:
+    theme_switch()
 st.caption("Independent implementation based on brisket time-temperature and hot-hold concepts shared by Steve Gow. Results are analytical estimates.")
 
 # Filled with the PDF download button once an analysis has run.
@@ -176,11 +235,7 @@ def phase_stats(valid, detection, transfer_time=None):
     work["elapsed"] = (work["timestamp"].shift(-1) - work["timestamp"]).dt.total_seconds()
     work = work[work["elapsed"].notna() & (work["elapsed"] > 0)]
     pull = transfer_time if transfer_time is not None else detection.pull_timestamp
-    if detection.session_type == "Cook Only":
-        cook, hold = work, work.iloc[0:0]
-    elif detection.session_type in ("Hold Only", "Calibration / Hold Test"):
-        cook, hold = work.iloc[0:0], work
-    elif pull is not None:
+    if pull is not None:
         # Split each interval at the transfer, as the rendering calculation does.
         pull = pd.Timestamp(pull)
         cook_seconds = (pull - work["timestamp"]).dt.total_seconds().clip(lower=0)
@@ -188,6 +243,10 @@ def phase_stats(valid, detection, transfer_time=None):
         cook = work.assign(elapsed=cook_seconds)
         hold = work.assign(elapsed=work["elapsed"] - cook_seconds)
         cook, hold = cook[cook["elapsed"] > 0], hold[hold["elapsed"] > 0]
+    elif detection.session_type == "Cook Only":
+        cook, hold = work, work.iloc[0:0]
+    elif detection.session_type in ("Hold Only", "Calibration / Hold Test"):
+        cook, hold = work.iloc[0:0], work
     else:
         cook, hold = work.iloc[0:0], work.iloc[0:0]
 
@@ -201,10 +260,10 @@ def phase_stats(valid, detection, transfer_time=None):
 
 def derive_transfer_time(meat_results):
     pulls = sorted(
-        pd.Timestamp(item["result"].detection.pull_timestamp)
+        pd.Timestamp(item["detection"].pull_timestamp)
         for item in meat_results.values()
-        if item["result"].detection.session_type == "Cook + Hold"
-        and item["result"].detection.pull_timestamp is not None
+        if item["detection"].session_type == "Cook + Hold"
+        and item["detection"].pull_timestamp is not None
     )
     if not pulls:
         return None
@@ -299,25 +358,26 @@ def accumulated_frame(result, master_start):
     if timeline.empty:
         return pd.DataFrame(columns=["Elapsed session hours", "Accumulated %"])
     start = pd.Timestamp(master_start)
-    points = [{"Elapsed session hours": (pd.Timestamp(timeline["Timestamp"].iloc[0]) - start).total_seconds() / 3600, "Accumulated %": 0.0}]
-    for _, row in timeline.iterrows():
-        end_hours = (pd.Timestamp(row["Next timestamp"]) - start).total_seconds() / 3600
-        if str(row["Status"]).startswith("Excluded"):
-            points.append({"Elapsed session hours": end_hours - 1e-6, "Accumulated %": None})
-        points.append({"Elapsed session hours": end_hours, "Accumulated %": row["Accumulated rendering"] * 100})
-    return pd.DataFrame(points)
+    ends = (timeline["Next timestamp"] - start).dt.total_seconds().to_numpy() / 3600
+    values = timeline["Accumulated rendering"].to_numpy() * 100
+    excluded = timeline["Status"].str.startswith("Excluded").to_numpy()
+    first = (pd.Timestamp(timeline["Timestamp"].iloc[0]) - start).total_seconds() / 3600
+    # An empty point just before the end of each excluded interval breaks the line there.
+    breaks = pd.DataFrame({"Elapsed session hours": ends[excluded] - 1e-6, "Accumulated %": np.nan})
+    points = pd.DataFrame({"Elapsed session hours": np.concatenate([[first], ends]), "Accumulated %": np.concatenate([[0.0], values])})
+    return pd.concat([points, breaks], ignore_index=True).sort_values("Elapsed session hours", kind="stable").reset_index(drop=True)
 
 
 def crossing_time(result, target):
     """When accumulated rendering first reached target (a fraction), interpolated within the interval."""
-    previous = 0.0
-    for _, row in result.timeline.iterrows():
-        current = row["Accumulated rendering"]
-        if current >= target and row["Incremental rendering"] > 0:
-            share = (target - previous) / row["Incremental rendering"]
-            return pd.Timestamp(row["Timestamp"]) + pd.Timedelta(seconds=row["Elapsed seconds"] * share)
-        previous = current
-    return None
+    timeline = result.timeline
+    reached = (timeline["Accumulated rendering"] >= target) & (timeline["Incremental rendering"] > 0)
+    if not reached.any():
+        return None
+    row = timeline[reached].iloc[0]
+    previous = row["Accumulated rendering"] - row["Incremental rendering"]
+    share = (target - previous) / row["Incremental rendering"]
+    return pd.Timestamp(row["Timestamp"]) + pd.Timedelta(seconds=row["Elapsed seconds"] * share)
 
 
 def milestone_text(result, master_start, transfer_time):
@@ -425,7 +485,7 @@ def consolidate_meat_profiles(raw_results, manual_gap=None):
         for _, item in members:
             streams.append((item["valid"], item["sample"]["threshold"]))
             sources.append(item["source"])
-            report = item["result"].report
+            report = item["report"]
             source_rows += report.source_rows
             valid_rows += report.valid_rows
             invalid_rows += report.invalid_rows
@@ -453,9 +513,9 @@ def consolidate_meat_profiles(raw_results, manual_gap=None):
             "threshold": max(x["threshold"] for x in member_samples),
             "mode": member_samples[0]["mode"],
         }
-        result = engine.analyse(valid, report, detection, max_gap=sample["threshold"])
         consolidated[role] = {
-            "result": result,
+            "report": report,
+            "detection": detection,
             "valid": valid,
             "source": "; ".join(dict.fromkeys(sources)),
             "sources": list(dict.fromkeys(sources)),
@@ -471,8 +531,8 @@ def reanalyse_canonical_profiles(canonical_results, transfer_time):
     for role, item in canonical_results.items():
         result = engine.analyse(
             item["valid"],
-            item["result"].report,
-            item["result"].detection,
+            item["report"],
+            item["detection"],
             pull_override=transfer_time,
             max_gap=item["sample"]["threshold"],
         )
@@ -507,6 +567,62 @@ def overall_brisket_assessment(canonical_results):
         "spread_note": spread_note,
     }
 
+def manual_transfer_time():
+    """The transfer time the user set, or None while it is on Automatic.
+
+    The widgets are drawn in the summary section (after the analysis), so their
+    values are read here from the previous run, as for the sampling settings.
+    """
+    if st.session_state.get("transfer_mode") != "Set manually":
+        return None
+    day, clock = st.session_state.get("transfer_date"), st.session_state.get("transfer_clock")
+    if day is None or clock is None:
+        return None
+    moment = pd.Timestamp(datetime.combine(day, clock))
+    return moment.tz_localize(VIEW_TZ, ambiguous=True, nonexistent="shift_forward")
+
+
+def transfer_panel(automatic, manual, environment_inputs, meat_results):
+    """Show the smoker-to-hold transfer in use, how it was found, and let the user set it."""
+    used = manual if manual is not None else automatic
+    if used is not None:
+        how = "set by you" if manual is not None else "estimated from where the brisket temperatures peak"
+        st.info(f"Smoker-to-hold transfer: **{used:%d/%m/%Y %H:%M}** ({how}).")
+    else:
+        st.info("No smoker-to-hold transfer was found, so readings count by session type. You can set one below.")
+    if manual is None and automatic is not None:
+        # The smoker log stopping well before the estimate is a strong sign the brisket moved earlier.
+        cook_ends = [item["prepared"]["timestamp"].max() for item in environment_inputs
+                     if item["role"] in (COOK_PID, COOK_GRATE) and not item["prepared"].empty]
+        if cook_ends and min(cook_ends) < automatic - pd.Timedelta(minutes=10):
+            end = max(t for t in cook_ends if t < automatic)
+            st.caption(f"The cook environment readings stop at {end:%H:%M}, {int((automatic - end).total_seconds() // 60)} min before this estimate. "
+                       "The brisket keeps rising for a while after it leaves the smoker, so if it moved at "
+                       f"{end:%H:%M}, set the transfer to that time below.")
+    if manual is not None:
+        stamps = pd.concat([item["valid"]["timestamp"] for item in meat_results.values()])
+        if manual < stamps.min() or manual > stamps.max():
+            st.warning("The transfer you set is outside the brisket readings, so the whole session counts as one phase.")
+    with st.expander("Smoker-to-hold transfer", expanded=manual is not None):
+        default = (used if used is not None else
+                   pd.concat([item["valid"]["timestamp"] for item in meat_results.values()]).median())
+
+        def start_from_current():
+            # Switching to manual starts from the transfer in use, so nothing changes until it is edited.
+            if st.session_state.get("transfer_mode") == "Set manually" and "transfer_date" not in st.session_state:
+                st.session_state.transfer_date = default.date()
+                st.session_state.transfer_clock = default.time().replace(second=0, microsecond=0)
+
+        st.radio("Transfer time", ["Automatic", "Set manually"], key="transfer_mode", horizontal=True, on_change=start_from_current,
+                 help="Automatic uses the moment the brisket temperatures peak. Set it by hand if you know when the brisket left the smoker.")
+        if st.session_state.get("transfer_mode") == "Set manually":
+            day_col, time_col = st.columns(2)
+            day_col.date_input("Date", key="transfer_date", format="DD/MM/YYYY")
+            time_col.time_input("Time", key="transfer_clock", step=60)
+        st.caption("Rendering before the transfer counts as Cook and after it as Hold, for every probe. "
+                   "Cook environment readings are used up to the transfer and Hold environment readings from it.")
+
+
 # Step 1
 st.header("Step 1: Upload temperature files")
 upload_left, upload_right = st.columns(2)
@@ -518,16 +634,20 @@ if st.session_state.get("analysed_files") != files_key:
     st.session_state.analysed = False
     if st.session_state.get("override_files") != files_key:
         # A gap limit chosen for one set of files does not carry over to the next.
-        for key in ("override_gap", "manual_gap_seconds"):
+        for key in ("override_gap", "manual_gap_seconds", "transfer_mode", "transfer_date", "transfer_clock"):
             st.session_state.pop(key, None)
         st.session_state.override_files = files_key
         override_gap, manual_gap = False, None
 if primary is None:
     st.info("Upload a primary temperature file to begin.")
     st.stop()
-def time_notes(frame, column):
-    """How the time column was read, for the caption under each upload."""
-    notes = engine.parse_timestamps(frame[column], VIEW_TZ)[1]
+PARSED_TIMES = {}  # file label -> parsed time column, so each file's times are read once per run
+
+
+def time_notes(file_label, frame, column):
+    """Parse a file's time column once; return the notes for the caption under its upload."""
+    parsed, notes = engine.parse_timestamps(frame[column], VIEW_TZ)
+    PARSED_TIMES[file_label] = parsed
     if column == engine.COMBINED_TIME_COLUMN:
         notes.insert(0, "Separate date and time columns were combined.")
     return notes
@@ -541,7 +661,7 @@ try:
     primary_time, _ = engine.detect_columns(primary_df)
     classifications = pit.classify_columns(primary_df, primary_time)
     classifications["File"] = "Primary"
-    for note in time_notes(primary_df, primary_time):
+    for note in time_notes("Primary", primary_df, primary_time):
         upload_left.caption(f"🕒 {note}")
 except Exception as exc:
     st.error(f"The primary file could not be read: {exc}")
@@ -558,7 +678,7 @@ if secondary is not None:
         classifications2["File"] = "Secondary"
         classifications = pd.concat([classifications, classifications2], ignore_index=True)
         secondary_name = secondary.name
-        for note in time_notes(secondary_df, secondary_time):
+        for note in time_notes("Secondary", secondary_df, secondary_time):
             upload_right.caption(f"🕒 {note}")
     except Exception as exc:
         upload_right.error(f"The secondary file could not be read and is left out: {exc}")
@@ -572,13 +692,14 @@ if classifications.empty:
 st.header("Step 2: Assign probe and environment roles")
 roles = {}
 role_columns = dict(zip(("Primary", "Secondary"), st.columns(2)))
-for file_label, colour, icon in (("Primary", "#eaf3ff", "🟦"), ("Secondary", "#edf9ef", "🟩")):
+for file_label, icon in (("Primary", "🟦"), ("Secondary", "🟩")):
     group = classifications[classifications["File"] == file_label]
     if group.empty:
         continue
     filename = primary_name if file_label == "Primary" else secondary_name
     with role_columns[file_label]:
-        st.markdown(f'<div style="background:{colour};color:#172033;padding:12px 16px;border-radius:10px;border:1px solid #d8dee6;margin-bottom:8px"><b>{icon} {file_label.upper()} FILE</b><br><small>{escape(str(filename))}</small></div>', unsafe_allow_html=True)
+        background, border, text = FILE_BOX[file_label]
+        st.markdown(f'<div style="background:{background};color:{text};padding:12px 16px;border-radius:10px;border:1px solid {border};margin-bottom:8px"><b>{icon} {file_label.upper()} FILE</b><br><small>{escape(str(filename))}</small></div>', unsafe_allow_html=True)
         for _, row in group.iterrows():
             raw_column = row["Column"]
             shown_column = row.get("Display column", pit.normalise_column_name(raw_column))
@@ -613,14 +734,14 @@ for _, row in classifications.iterrows():
     active_time = primary_time if file_label == "Primary" else secondary_time
     try:
         if role in MEAT_ROLES:
-            valid, report = engine.prepare(active_df, active_time, raw_column, VIEW_TZ)
-            detection = engine.classify_session(valid)
+            valid, report = engine.prepare(active_df, active_time, raw_column, VIEW_TZ, PARSED_TIMES.get(file_label))
+            if len(valid) < 5:
+                raise ValueError("At least five valid readings are required.")
             sample = sampling_info(valid, manual_gap)
-            result = engine.analyse(valid, report, detection, max_gap=sample["threshold"])
             label = unique_label(role, file_label, shown_column, raw_meat_results)
-            raw_meat_results[label] = {"result": result, "valid": valid, "source": display_source(f"{file_label} / {shown_column}"), "sample": sample}
+            raw_meat_results[label] = {"report": report, "valid": valid, "source": display_source(f"{file_label} / {shown_column}"), "sample": sample}
         elif role in ENVIRONMENT_ROLES:
-            environment_inputs.append({"role": role, "file": file_label, "column": raw_column, "shown": shown_column, "df": active_df, "time": active_time})
+            environment_inputs.append({"role": role, "file": file_label, "column": raw_column, "shown": shown_column, "df": active_df, "time": active_time, "times": PARSED_TIMES.get(file_label)})
     except Exception as exc:
         errors.append(f"{file_label} / {shown_column}: {exc}")
 for error in errors:
@@ -633,12 +754,16 @@ if not raw_meat_results:
     st.stop()
 
 meat_results = consolidate_meat_profiles(raw_meat_results, manual_gap)
-transfer_time = derive_transfer_time(meat_results)
+automatic_transfer = derive_transfer_time(meat_results)
+manual_transfer = manual_transfer_time()
+transfer_time = manual_transfer if manual_transfer is not None else automatic_transfer
 meat_results = reanalyse_canonical_profiles(meat_results, transfer_time)
 overall_assessment = overall_brisket_assessment(meat_results)
+for item in environment_inputs:
+    item["prepared"] = pit.prepare(item["df"], item["time"], item["column"], VIEW_TZ, item["times"])
 environment_results, environment_sources = {}, {}
 for item in environment_inputs:
-    prepared = pit.prepare(item["df"], item["time"], item["column"], VIEW_TZ)
+    prepared = item["prepared"]
     segmented = segment_environment(prepared, item["role"], transfer_time)
     if segmented.empty:
         st.warning(f"{item['file']} / {item['shown']}: no readings overlap the applicable phase.")
@@ -649,8 +774,7 @@ for item in environment_inputs:
 
 master_start = derive_master_start(meat_results, environment_results)
 st.header("Session detection summary")
-if transfer_time is not None:
-    st.info(f"Derived smoker-to-hold transfer boundary: {transfer_time:%d/%m/%Y %H:%M:%S}")
+transfer_panel(automatic_transfer, manual_transfer, environment_inputs, meat_results)
 summary, stats = [], {}
 for label, item in meat_results.items():
     result = item["result"]
@@ -764,8 +888,8 @@ rendering_figure = px.line(
     title="Accumulated rendering over time",
     labels={"Elapsed session hours": "Elapsed time from session start (hours)", "Accumulated %": "Accumulated rendering (%)", "Location": ""},
 )
-rendering_figure.add_hrect(y0=95, y1=105, fillcolor="rgba(12,163,12,0.14)", line_width=0, layer="below",
-                           annotation_text="Ideal", annotation_position="top left", annotation_font_color="#0a7a0a")
+rendering_figure.add_hrect(y0=95, y1=105, fillcolor=IDEAL_FILL, line_width=0, layer="below",
+                           annotation_text="Ideal", annotation_position="top left", annotation_font_color=IDEAL_TEXT)
 rendering_figure = style_figure(add_transfer_marker(rendering_figure, transfer_time, master_start), "%")
 st.plotly_chart(rendering_figure, width="stretch", key="accumulated_rendering")
 for label, item in meat_results.items():
@@ -816,6 +940,7 @@ pdf_bytes = build_pdf_report(
     environment_integrity=integrity,
     overall_assessment=overall_assessment,
     generated_at=report_time(),
+    transfer_set_by_user=manual_transfer is not None,
 )
 report_name = f"brisket_tenderness_report_{pd.Timestamp(master_start):%Y-%m-%d}.pdf" if master_start is not None else "brisket_tenderness_report.pdf"
 report_slot.download_button("📄 Download full PDF report", data=pdf_bytes, file_name=report_name, mime="application/pdf", type="primary", width="stretch", on_click="ignore")

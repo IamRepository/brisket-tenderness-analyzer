@@ -128,9 +128,9 @@ def classify_columns(df: pd.DataFrame, timestamp_col: str) -> pd.DataFrame:
     return pd.DataFrame(rows, columns=["Column", "Display column", "Suggested role", "Confidence"])
 
 
-def prepare(df: pd.DataFrame, timestamp_col: str, temp_col: str, tz: str = meat.LOCAL_TZ) -> pd.DataFrame:
+def prepare(df: pd.DataFrame, timestamp_col: str, temp_col: str, tz: str = meat.LOCAL_TZ, timestamps=None) -> pd.DataFrame:
     prepared = pd.DataFrame({
-        "timestamp": meat.parse_ts(df[timestamp_col], tz),
+        "timestamp": timestamps if timestamps is not None else meat.parse_ts(df[timestamp_col], tz),
         "temperature_c": meat.parse_temp(df[temp_col]),
     }).dropna()
     prepared = prepared[prepared["temperature_c"].between(-20, 400)]

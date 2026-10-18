@@ -83,6 +83,8 @@ def _date_order(text):
         return 'dayfirst'
     if (second > 12).any():
         return 'monthfirst'
+    if len(sample) > 2000:  # an even sample keeps this quick on long logs
+        sample = sample.iloc[np.linspace(0, len(sample) - 1, 2000).astype(int)]
     spans = {}
     for order in ('dayfirst', 'monthfirst'):
         parsed = _parse_text(sample, order, utc=False)
@@ -295,17 +297,32 @@ def detect_columns(df):
     return timestamp, probes
 
 
-def prepare(df, timestamp_col, probe_col, tz=LOCAL_TZ):
-    raw = pd.DataFrame({'timestamp': parse_ts(df[timestamp_col], tz), 'temperature_c': parse_temp(df[probe_col])})
+def prepare(df, timestamp_col, probe_col, tz=LOCAL_TZ, timestamps=None):
+    """Valid readings of one probe column. timestamps: the already-parsed time column, to avoid parsing it again."""
+    stamps = timestamps if timestamps is not None else parse_ts(df[timestamp_col], tz)
+    raw = pd.DataFrame({'timestamp': stamps, 'temperature_c': parse_temp(df[probe_col])})
     mask = raw.timestamp.notna() & raw.temperature_c.between(-20, 150); valid = raw[mask].copy().sort_values('timestamp', kind='stable')
     duplicates = int(valid.duplicated('timestamp', keep='last').sum()); valid = valid.drop_duplicates('timestamp', keep='last').reset_index(drop=True)
     return valid, ParseReport(len(raw), len(valid), int((~mask).sum()), duplicates, valid.timestamp.min() if len(valid) else None, valid.timestamp.max() if len(valid) else None)
 
+MIN_HOLD_AFTER_PEAK_S = 30 * 60  # readings after the peak needed to call it a hold or rest
+SMOOTH_WINDOW_S = 15 * 60        # rolling-median window used to find the peak
+EDGE_WINDOW_S = 10 * 60          # first/last stretch used for the start and end temperatures
+
 def classify_session(valid):
     if len(valid)<5: raise ValueError('At least five valid readings are required.')
-    span=max(5,min(61,len(valid)//30*2+1)); smooth=valid.temperature_c.astype(float).rolling(span,center=True,min_periods=1).median().reset_index(drop=True)
-    peak_i=int(smooth.idxmax()); peak=float(smooth.iloc[peak_i]); edge=max(2,len(smooth)//20); start=float(smooth.iloc[:edge].median()); end=float(smooth.iloc[-edge:].median()); rise=peak-start; fall=peak-end; fraction=peak_i/max(len(smooth)-1,1); pull=pd.Timestamp(valid.timestamp.iloc[peak_i])
-    if rise>=25 and fall>=8 and .15<=fraction<=.9: return Detection('Cook + Hold',95,pull,peak,float(smooth.mean()),float(smooth.min()),'A substantial temperature rise is followed by a sustained cooling phase.')
+    # Smoothing and the start/end levels are measured in time, not in readings, so the
+    # result is the same at 2-second and 15-minute logging and a short rest is not averaged away.
+    step=float(valid.timestamp.diff().dt.total_seconds().median() or 60)
+    span=int(min(61,max(3,round(SMOOTH_WINDOW_S/step))))|1
+    smooth=valid.temperature_c.astype(float).rolling(span,center=True,min_periods=1).median().reset_index(drop=True)
+    edge=int(max(3,min(len(smooth)//4,round(EDGE_WINDOW_S/step))))
+    peak_i=int(smooth.idxmax()); peak=float(smooth.iloc[peak_i]); raw=valid.temperature_c.astype(float).reset_index(drop=True); start=float(raw.iloc[:edge].median()); end=float(raw.iloc[-edge:].median()); rise=peak-start; fall=peak-end; fraction=peak_i/max(len(smooth)-1,1); pull=pd.Timestamp(valid.timestamp.iloc[peak_i])
+    # A cook and hold needs a real rise, then at least MIN_HOLD_AFTER_PEAK of readings after the peak
+    # with a clear fall. Time after the peak, not its position in the session, decides, so a long
+    # cook with a one-hour rest is still a cook and hold.
+    after_peak=(valid.timestamp.iloc[-1]-valid.timestamp.iloc[peak_i]).total_seconds()
+    if rise>=25 and fall>=8 and fraction>=.15 and after_peak>=MIN_HOLD_AFTER_PEAK_S: return Detection('Cook + Hold',95,pull,peak,float(smooth.mean()),float(smooth.min()),'A substantial temperature rise is followed by a sustained cooling phase.')
     if rise<15 and fall>=8 and fraction<=.25:
         duration=(valid.timestamp.iloc[-1]-valid.timestamp.iloc[0]).total_seconds()/3600; label='Calibration / Hold Test' if duration>=8 and end>=55 else 'Hold Only'; return Detection(label,90,None,peak,float(smooth.mean()),float(smooth.min()),'No clear cooking rise was detected; the profile begins hot and cools over time.')
     if rise>=20 and fall<8: return Detection('Cook Only',90,None,peak,float(smooth.mean()),float(smooth.min()),'The profile rises substantially and ends without a sustained cooling phase.')
@@ -316,34 +333,92 @@ def assess(value):
     p=value*100
     return 'Underdone and tight' if p<80 else 'Slightly tight but sliceable' if p<95 else 'Ideal tenderness' if p<=105 else 'Very soft and potentially overdone' if p<=120 else 'Increased risk of mushy or over-rendered texture'
 
-def analyse(valid,report,detection,pull_override=None,max_gap=10):
-    pull=pd.Timestamp(pull_override) if pull_override is not None else detection.pull_timestamp; mode=detection.session_type; seconds=np.zeros((2,10)); below=gapseconds=0.; gaps=0; cumulative=0.; rows=[]
-    for i in range(len(valid)-1):
-        start=pd.Timestamp(valid.timestamp.iloc[i]); end=pd.Timestamp(valid.timestamp.iloc[i+1]); elapsed=(end-start).total_seconds(); temp=float(valid.temperature_c.iloc[i]); status='Analysed'; phase=''; increment=0.
-        if elapsed<=0: status='Excluded: non-positive interval'
-        elif elapsed>max_gap: status='Excluded: recording gap'; gaps+=1; gapseconds+=elapsed
-        else:
-            bi=band(temp)
-            if bi<0: status='Below model range'; below+=elapsed
-            else:
-                if mode=='Cook Only': parts=[(0,elapsed,'Cook')]
-                elif mode in ('Hold Only','Calibration / Hold Test'): parts=[(1,elapsed,'Hold / cooldown')]
-                elif pull is not None:
-                    if end<=pull: parts=[(0,elapsed,'Cook')]
-                    elif start>=pull: parts=[(1,elapsed,'Hold / cooldown')]
-                    else:
-                        cs=max((pull-start).total_seconds(),0); parts=[(0,cs,'Cook'),(1,elapsed-cs,'Hold / cooldown')]
-                else: parts=[]; status='Unclassified interval'
-                for pi,dur,label in parts:
-                    if dur>0: seconds[pi,bi]+=dur; increment+=dur/3600*ZONE_RATES[bi]
-                phase=' → '.join(dict.fromkeys(x[2] for x in parts))
-        cumulative+=increment; rows.append({'Timestamp':start,'Temperature °C':temp,'Next timestamp':end,'Elapsed seconds':elapsed,'Phase':phase,'Status':status,'Incremental rendering':increment,'Accumulated rendering':cumulative})
-    records=[]
-    for pi,name in enumerate(('Cook','Hold / cooldown')):
+HOLD_MODES = ('Hold Only', 'Calibration / Hold Test')
+
+
+def analyse(valid, report, detection, pull_override=None, max_gap=10):
+    """Rendering over every interval between consecutive readings, all at once.
+
+    Each interval uses the temperature at its start. Intervals that are not
+    positive or longer than max_gap (seconds) are excluded; below 60 C nothing
+    is added. When a transfer time is known (pull_override, or the profile's
+    own detected pull) every interval is split at it into Cook and Hold;
+    without one, Cook Only and Hold Only profiles count wholly as that phase.
+    """
+    mode = detection.session_type
+    pull = pd.Timestamp(pull_override) if pull_override is not None else detection.pull_timestamp
+    stamps = valid['timestamp'].reset_index(drop=True)
+    temps = valid['temperature_c'].to_numpy(dtype=float)
+    if len(stamps) >= 2:
+        first = stamps.iloc[0]
+        offsets = (stamps - first).dt.total_seconds().to_numpy()
+    else:
+        first, offsets = (stamps.iloc[0] if len(stamps) else None), np.zeros(len(stamps))
+    elapsed = np.diff(offsets)
+    temp = temps[:-1] if len(temps) else temps
+    starts = offsets[:-1] if len(offsets) else offsets
+
+    not_positive = elapsed <= 0
+    gap = ~not_positive & (elapsed > max_gap)
+    counted = ~not_positive & ~gap
+    band_index = np.where(temp < 60, -1, np.minimum(np.searchsorted(BAND_LOWER_C, temp, side='right') - 1, 9))
+    below = counted & (band_index < 0)
+    in_model = counted & (band_index >= 0)
+    positive = np.maximum(elapsed, 0.0)
+
+    unclassified = np.zeros(len(elapsed), dtype=bool)
+    if pull is not None:
+        cook_seconds = np.minimum(np.maximum((pull - first).total_seconds() - starts, 0.0), positive)
+        hold_seconds = positive - cook_seconds
+    elif mode == 'Cook Only':
+        cook_seconds, hold_seconds = positive, np.zeros(len(elapsed))
+    elif mode in HOLD_MODES:
+        cook_seconds, hold_seconds = np.zeros(len(elapsed)), positive
+    else:
+        cook_seconds = hold_seconds = np.zeros(len(elapsed))
+        unclassified = in_model
+    cook_seconds = np.where(in_model, cook_seconds, 0.0)
+    hold_seconds = np.where(in_model, hold_seconds, 0.0)
+
+    rate = ZONE_RATES[np.clip(band_index, 0, 9)]
+    increment = np.where(in_model, (cook_seconds + hold_seconds) / 3600 * rate, 0.0)
+    seconds = np.zeros((2, 10))
+    if in_model.any():
+        seconds[0] = np.bincount(band_index[in_model], weights=cook_seconds[in_model], minlength=10)
+        seconds[1] = np.bincount(band_index[in_model], weights=hold_seconds[in_model], minlength=10)
+
+    status = np.select([not_positive, gap, below, unclassified],
+                       ['Excluded: non-positive interval', 'Excluded: recording gap', 'Below model range', 'Unclassified interval'],
+                       'Analysed')
+    phase = np.select([in_model & (cook_seconds > 0) & (hold_seconds > 0), in_model & (cook_seconds > 0), in_model & (hold_seconds > 0)],
+                      ['Cook → Hold / cooldown', 'Cook', 'Hold / cooldown'], '')
+    timeline = pd.DataFrame({
+        'Timestamp': stamps.iloc[:-1].reset_index(drop=True) if len(stamps) else stamps,
+        'Temperature °C': temp,
+        'Next timestamp': stamps.iloc[1:].reset_index(drop=True) if len(stamps) else stamps,
+        'Elapsed seconds': elapsed,
+        'Phase': phase,
+        'Status': status,
+        'Incremental rendering': increment,
+        'Accumulated rendering': np.cumsum(increment),
+    })
+
+    records = []
+    for pi, name in enumerate(('Cook', 'Hold / cooldown')):
         for bi in range(10):
-            hours=seconds[pi,bi]/3600; records.append({'Phase':name,'Band':bi+1,'Temperature range':BAND_LABELS[bi],'Duration hours':hours,'Rate per hour':ZONE_RATES[bi],'Tenderness contribution':hours*ZONE_RATES[bi]})
-    summary=pd.DataFrame(records); cook=float(summary[summary.Phase=='Cook']['Tenderness contribution'].sum()); hold=float(summary[summary.Phase=='Hold / cooldown']['Tenderness contribution'].sum()); total=cook+hold
-    return Result(summary,pd.DataFrame(rows),report,detection,gaps,gapseconds/3600,below/3600,float(seconds.sum()/3600),cook,hold,total,assess(total),mode=='Cook + Hold' and pull is not None)
+            hours = seconds[pi, bi] / 3600
+            records.append({'Phase': name, 'Band': bi + 1, 'Temperature range': BAND_LABELS[bi], 'Duration hours': hours,
+                            'Rate per hour': ZONE_RATES[bi], 'Tenderness contribution': hours * ZONE_RATES[bi]})
+    summary = pd.DataFrame(records)
+    cook = float(summary[summary.Phase == 'Cook']['Tenderness contribution'].sum())
+    hold = float(summary[summary.Phase == 'Hold / cooldown']['Tenderness contribution'].sum())
+    total = cook + hold
+    # Complete = a real cook and hold: readings on both sides of a transfer that was either
+    # detected as Cook + Hold or set for the whole session (automatic or by hand).
+    complete = bool(pull is not None and (mode == 'Cook + Hold' or pull_override is not None)
+                    and len(stamps) >= 2 and stamps.iloc[0] < pull < stamps.iloc[-1])
+    return Result(summary, timeline, report, detection, int(gap.sum()), float(elapsed[gap].sum() / 3600),
+                  float(elapsed[below].sum() / 3600), float(seconds.sum() / 3600), cook, hold, total, assess(total), complete)
 
 def combine_probes(streams):
     """Merge several probes at one physical location into one profile.

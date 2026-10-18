@@ -213,6 +213,72 @@ class SessionAndRendering(unittest.TestCase):
         self.assertAlmostEqual(result.total, 0.29, places=6)
 
 
+def cook_and_rest(cook_h, rest_h, rest_end, step_min=1):
+    start = pd.Timestamp("2026-06-01 18:00", tz="Europe/Berlin")
+    t = start + pd.to_timedelta(np.arange(0, int((cook_h + rest_h) * 60) + 1, step_min), unit="min")
+    h = (t - start).total_seconds() / 3600
+    points, values = [0, 2, cook_h * 0.6, cook_h, cook_h + rest_h], [6, 40, 75, 94, rest_end]
+    return pd.DataFrame({"timestamp": t, "temperature_c": np.interp(h, points, values)}), start + pd.Timedelta(hours=cook_h)
+
+
+def report_for(frame):
+    return engine.ParseReport(len(frame), len(frame), 0, 0, frame.timestamp.min(), frame.timestamp.max())
+
+
+class ShortRests(unittest.TestCase):
+    def test_one_hour_rest_is_a_cook_and_hold(self):
+        for step in (1, 5, 15):
+            frame, true_pull = cook_and_rest(12, 1, 80, step)
+            detection = engine.classify_session(frame)
+            self.assertEqual(detection.session_type, "Cook + Hold", f"{step}-min logging")
+            self.assertLessEqual(abs((detection.pull_timestamp - true_pull).total_seconds()), step * 60 + 300)
+
+    def test_cook_without_rest_stays_cook_only(self):
+        frame, _ = cook_and_rest(10, 0.25, 93)
+        self.assertEqual(engine.classify_session(frame).session_type, "Cook Only")
+
+
+class RenderingCalculation(unittest.TestCase):
+    def test_interval_by_interval(self):
+        # 70 C for 60 s (band 2), 92 C for 120 s (band 7), a 10-min gap, 50 C for 60 s (below 60 C).
+        t = pd.to_datetime(["2026-06-01 10:00:00", "2026-06-01 10:01:00", "2026-06-01 10:03:00",
+                            "2026-06-01 10:13:00", "2026-06-01 10:14:00"]).tz_localize("Europe/Berlin")
+        frame = pd.DataFrame({"timestamp": t, "temperature_c": [70.0, 92.0, 92.0, 50.0, 50.0]})
+        detection = engine.Detection("Cook Only", 90, None, 92, 70, 50, "")
+        result = engine.analyse(frame, report_for(frame), detection, max_gap=180)
+        expected = 60 / 3600 * 0.0245 + 120 / 3600 * 0.29
+        self.assertAlmostEqual(result.total, expected, places=12)
+        self.assertEqual(result.timeline["Status"].tolist(), ["Analysed", "Analysed", "Excluded: recording gap", "Below model range"])
+        self.assertEqual(result.excluded_gaps, 1)
+        self.assertAlmostEqual(result.below_model_hours, 60 / 3600)
+
+    def test_transfer_splits_an_interval(self):
+        t = pd.to_datetime(["2026-06-01 10:00", "2026-06-01 10:02"]).tz_localize("Europe/Berlin")
+        frame = pd.DataFrame({"timestamp": t, "temperature_c": [92.0, 92.0]})
+        detection = engine.Detection("Cook + Hold", 95, None, 92, 92, 92, "")
+        result = engine.analyse(frame, report_for(frame), detection, pull_override=t[0] + pd.Timedelta(seconds=30), max_gap=180)
+        self.assertAlmostEqual(result.cook, 30 / 3600 * 0.29)
+        self.assertAlmostEqual(result.hold, 90 / 3600 * 0.29)
+        self.assertEqual(result.timeline["Phase"].iloc[0], "Cook → Hold / cooldown")
+
+    def test_transfer_set_for_the_session_splits_any_profile(self):
+        frame, _ = cook_and_rest(10, 0.25, 93)
+        detection = engine.classify_session(frame)
+        self.assertEqual(detection.session_type, "Cook Only")
+        transfer = frame.timestamp.iloc[0] + pd.Timedelta(hours=8)
+        result = engine.analyse(frame, report_for(frame), detection, pull_override=transfer, max_gap=180)
+        self.assertGreater(result.hold, 0)
+        self.assertTrue(result.complete)
+
+    def test_long_logs_are_fast(self):
+        import time
+        frame, _ = cook_and_rest(20, 4, 70, step_min=1)
+        frame = frame.set_index("timestamp").resample("2s").interpolate().reset_index()  # about 43,000 readings
+        started = time.perf_counter()
+        engine.analyse(frame, report_for(frame), engine.classify_session(frame), max_gap=6)
+        self.assertLess(time.perf_counter() - started, 1.0)
+
+
 class Stability(unittest.TestCase):
     def test_stepped_program_is_not_penalised(self):
         result = pit.analyse(profile([80] * 14 + [110] * 12 + [150] * 13), pit.COOK_PID)

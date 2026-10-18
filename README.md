@@ -21,6 +21,9 @@ Independent implementation based on brisket time-temperature and hot-hold concep
    - **Hold Environment - Probe**: the hold oven or cabinet.
    - **Ignore**: any column to leave out.
 3. **Analyse session.** Results stay on screen; changing a role or a setting updates them. The PDF download button appears at the top of the page.
+4. **Check the smoker-to-hold transfer.** It is estimated from where the brisket temperatures peak. If you know when the brisket left the smoker, set it under "Smoker-to-hold transfer".
+
+A **Dark mode** switch sits beside the title.
 
 ## What it reports
 
@@ -34,7 +37,7 @@ Independent implementation based on brisket time-temperature and hot-hold concep
 
 - Time at or above 60 °C adds rendering at an hourly rate that rises with temperature, across ten bands.
 - Time below 60 °C, and recording gaps longer than the gap limit, add nothing.
-- The cook and hold split at the smoker-to-hold transfer. The transfer is derived from the brisket probes; it's where they peak.
+- The cook and the hold split at the smoker-to-hold transfer. It is estimated from where the brisket probes peak, or set by hand; every probe is split at the same time.
 - The assessment scale:
 
 | Recorded total | Assessment |

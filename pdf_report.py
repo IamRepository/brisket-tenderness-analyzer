@@ -233,7 +233,7 @@ def _generated_text(generated_at):
 
 def build_pdf_report(app_version, configuration, meat_results, stats, environment_results, transfer_time,
                      environment_sources=None, master_start=None, cook_aggregate=None, hold_aggregate=None,
-                     environment_integrity=None, overall_assessment=None, generated_at=None):
+                     environment_integrity=None, overall_assessment=None, generated_at=None, transfer_set_by_user=False):
     environment_sources = environment_sources or {}
     environment_integrity = environment_integrity or []
     meat_starts = [x['valid'].timestamp.min() for x in meat_results.values() if not x['valid'].empty]
@@ -275,7 +275,7 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
     hold_seconds = (pd.Timestamp(session_end) - pd.Timestamp(transfer_time)).total_seconds() if transfer_time is not None and session_end is not None else None
     total_seconds = (pd.Timestamp(session_end) - pd.Timestamp(master_start)).total_seconds() if session_end is not None and master_start is not None else None
     s += [_table([['Session start', _when(master_start), 'Cook time', _hours(cook_seconds)],
-                  ['Transfer to hold', _when(transfer_time), 'Hold time', _hours(hold_seconds)],
+                  ['Transfer to hold', _when(transfer_time) + (' (set by hand)' if transfer_set_by_user and transfer_time is not None else ''), 'Hold time', _hours(hold_seconds)],
                   ['Last brisket reading', _when(session_end), 'Total', _hours(total_seconds)]],
                  [38*mm, 53*mm, 38*mm, 53*mm], header=False),
           Spacer(1, 2*mm)]
