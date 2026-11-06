@@ -71,3 +71,7 @@ python -m unittest test_analyzer
 ## Deploying on Streamlit Community Cloud
 
 After uploading a release that changes more than `app.py`, reboot the app (**Manage app → ⋮ → Reboot app**). Otherwise Streamlit can keep the previous version of the helper modules in memory.
+
+## Licence
+
+Copyright © 2026 Imran Abdul-Majid. All rights reserved. No licence is granted to copy, change, distribute or use this code; see [LICENSE](LICENSE).
