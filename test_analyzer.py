@@ -10,6 +10,8 @@ import numpy as np
 import pandas as pd
 
 import brisket_engine as engine
+import labels
+import pdf_report
 import pit_engine as pit
 
 T0 = pd.Timestamp("2026-01-01 08:00")
@@ -299,6 +301,137 @@ class Stability(unittest.TestCase):
     def test_constant_hold_is_fully_stable(self):
         result = pit.analyse(profile([75.0] * 48), pit.HOLD_ENV)
         self.assertEqual(result.stability_score, 100.0)
+
+
+class MixedTimeZones(unittest.TestCase):
+    """A time column that mixes zoned and unzoned values is read value by value, never as one zone."""
+
+    def test_minority_zoned(self):
+        text = [f"2026-06-01 18:{m:02d}:00" for m in range(10)]
+        text[3] = "2026-06-01 18:03:00+02:00"
+        parsed, notes = engine.parse_timestamps(pd.Series(text), "Europe/Berlin")
+        self.assertEqual(parsed.iloc[3], pd.Timestamp("2026-06-01 18:03", tz="Europe/Berlin"))
+        self.assertEqual(parsed.iloc[4], pd.Timestamp("2026-06-01 18:04", tz="Europe/Berlin"))
+        self.assertTrue(any("some do not" in note for note in notes))
+
+    def test_majority_zoned_leaves_unzoned_in_local_time_not_utc(self):
+        text = [f"2026-06-01 18:{m:02d}:00+02:00" for m in range(10)]
+        text[3] = "2026-06-01 18:03:00"
+        parsed, _ = engine.parse_timestamps(pd.Series(text), "Europe/Berlin")
+        self.assertEqual(parsed.iloc[3], pd.Timestamp("2026-06-01 18:03", tz="Europe/Berlin"))
+        self.assertEqual(parsed.iloc[2], pd.Timestamp("2026-06-01 18:02", tz="Europe/Berlin"))
+
+    def test_zoned_value_is_converted_to_the_viewer_zone(self):
+        text = ["13/06/2026 16:00:00Z"] + [f"13/06/2026 18:{m:02d}:00" for m in range(1, 10)]
+        parsed, _ = engine.parse_timestamps(pd.Series(text), "Europe/Oslo")
+        self.assertEqual(parsed.iloc[0], pd.Timestamp("2026-06-13 18:00", tz="Europe/Oslo"))
+
+    def test_all_zoned_and_all_unzoned_are_unchanged(self):
+        zoned, notes = engine.parse_timestamps(pd.Series([f"2026-06-01 16:0{m}:00Z" for m in range(5)]), "Europe/Berlin")
+        self.assertEqual(zoned.iloc[0], pd.Timestamp("2026-06-01 18:00", tz="Europe/Berlin"))
+        self.assertFalse(any("some do not" in note for note in notes))
+
+
+class DetectColumns(unittest.TestCase):
+    def hot_pit_file(self, blank_rows=0):
+        times = pd.Series(pd.date_range("2026-06-13 06:00", periods=60, freq="1min").strftime("%d/%m/%Y %H:%M:%S"), dtype=object)
+        values = pd.Series(165.0 + np.sin(np.arange(60)), dtype=object)
+        times.iloc[:blank_rows] = np.nan
+        values.iloc[:blank_rows] = np.nan
+        return pd.DataFrame({"Time": times, "Smoker": values})
+
+    def test_environment_only_file_is_accepted_when_probes_are_not_required(self):
+        timestamp, probes = engine.detect_columns(self.hot_pit_file(), require_probes=False)
+        self.assertEqual(timestamp, "Time")
+        self.assertEqual(probes, [])
+
+    def test_environment_only_file_still_raises_by_default(self):
+        with self.assertRaises(ValueError):
+            engine.detect_columns(self.hot_pit_file())
+
+    def test_blank_leading_rows_do_not_hide_the_columns(self):
+        frame = self.hot_pit_file(blank_rows=5)
+        frame = frame.rename(columns={"Time": "Clock reading"})
+        timestamp, _ = engine.detect_columns(frame, require_probes=False)
+        self.assertEqual(timestamp, "Clock reading")
+        point = pd.DataFrame({"Clock reading": frame["Clock reading"], "Point": [np.nan] * 5 + [60.0 + i for i in range(55)]})
+        self.assertEqual(engine.detect_columns(point)[1], ["Point"])
+
+    def test_empty_worksheet_gets_a_clear_message(self):
+        for frame in (pd.DataFrame(), pd.DataFrame({"Timestamp": [np.nan], "Point": [np.nan]})):
+            with self.assertRaisesRegex(ValueError, "worksheet is empty"):
+                engine.detect_columns(frame)
+
+
+class FileSize(unittest.TestCase):
+    def test_a_file_above_the_row_limit_is_refused_with_a_message(self):
+        text = "Timestamp,Point\n" + "".join(f"01/01/2026 08:{m:02d}:00,{60 + m}\n" for m in range(10))
+        original = engine.MAX_ROWS
+        engine.MAX_ROWS = 5
+        try:
+            with self.assertRaisesRegex(ValueError, "10 rows, more than the 5"):
+                engine.read_file(io.BytesIO(text.encode()), "big.csv")
+        finally:
+            engine.MAX_ROWS = original
+        self.assertEqual(len(engine.read_file(io.BytesIO(text.encode()), "ok.csv")["CSV"]), 10)
+
+
+class Labels(unittest.TestCase):
+    def test_markdown_in_file_names_is_neutralised(self):
+        shown = labels.md_safe("[link](https://example.com) ![i](https://example.com/p.png) *bold* `x`")
+        for character in "[]()*`!":
+            self.assertNotIn(character, shown.replace("\\" + character, ""))
+        self.assertNotIn("://", shown)  # no web address left for the renderer to turn into a link
+
+    def test_addresses_and_emoji_codes_are_broken_up(self):
+        for text in ("www.example.com", "WWW.example.com", "someone@example.com", ":smile:", ":material/timer:"):
+            shown = labels.md_safe(text)
+            self.assertIn("\u200b", shown)
+            self.assertEqual(shown.replace("\u200b", ""), text)
+
+    def test_ordinary_names_read_the_same(self):
+        self.assertEqual(labels.md_safe("Hold probe"), "Hold probe")
+        self.assertEqual(labels.md_safe("Hold probe 2 (top) 75.0"), "Hold probe 2 \\(top\\) 75.0")
+
+    def test_plotly_names_cannot_carry_tags(self):
+        self.assertEqual(labels.plotly_text('<a href="x">Hold & co</a>'), '&lt;a href="x"&gt;Hold &amp; co&lt;/a&gt;')
+
+    def test_same_role_and_column_in_two_files_get_two_labels(self):
+        taken = {}
+        for file_label in ("Primary", "Secondary"):
+            taken[labels.unique_label("Hold", file_label, "Hold probe", taken)] = 1
+        self.assertEqual(len(taken), 2)
+
+    def test_stream_names_tell_sensors_of_one_role_apart(self):
+        names = labels.environment_stream_names({
+            "a": ("Hold Environment", "Secondary", "Hold top"),
+            "b": ("Hold Environment", "Secondary", "Hold bottom"),
+            "c": ("Cook Environment - Grate", "Primary", "Grate Probe"),
+        })
+        self.assertEqual(names["a"], "Hold Environment (Hold top)")
+        self.assertEqual(names["b"], "Hold Environment (Hold bottom)")
+        self.assertEqual(names["c"], "Cook Environment - Grate")
+
+    def test_stream_names_add_the_file_when_columns_repeat(self):
+        names = labels.environment_stream_names({
+            "a": ("Hold Environment", "Primary", "Hold probe"),
+            "b": ("Hold Environment", "Secondary", "Hold probe"),
+        })
+        self.assertEqual(len(set(names.values())), 2)
+        self.assertIn("Primary / Hold probe", names["a"])
+
+
+class PdfTimes(unittest.TestCase):
+    def test_negative_durations_keep_their_sign(self):
+        self.assertEqual(pdf_report._hours(-1800), "-0 h 30 min")
+        self.assertEqual(pdf_report._hours(5400), "1 h 30 min")
+        self.assertEqual(pdf_report._hours(0), "0 h 00 min")
+        self.assertEqual(pdf_report._hours(None), "N/A")
+
+    def test_source_is_split_into_file_and_column(self):
+        self.assertEqual(pdf_report._split_source("Secondary / Hold top"), ("Secondary", "Hold top"))
+        self.assertEqual(pdf_report._split_source("Hold top"), ("", "Hold top"))
+        self.assertEqual(pdf_report._split_source(None), ("", ""))
 
 
 if __name__ == "__main__":

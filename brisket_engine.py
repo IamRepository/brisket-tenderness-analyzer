@@ -177,8 +177,18 @@ def parse_timestamps(s, tz=LOCAL_TZ):
         return _localise(parsed, tz, notes), notes
 
     text = _zone_word_to_offset(text)
-    has_offset = text.dropna().str.contains(_OFFSET_RE, regex=True).mean() > 0.5
+    zoned = text.str.contains(_OFFSET_RE, regex=True).fillna(False).astype(bool)
+    zoned_share = float(zoned[text.notna()].mean()) if text.notna().any() else 0.0
     order = _date_order(text)
+    if 0 < zoned_share < 1:
+        # Some times carry a zone and some do not: read each kind by its own rule.
+        if order == 'monthfirst':
+            notes.append('Dates read as month/day/year.')
+        notes.append(f'Some times carry a time zone and some do not. Those without are read as {tz} time.')
+        with_zone = _parse_text(text.where(zoned), order, utc=True).dt.tz_convert(tz)
+        without_zone = _localise(_parse_text(text.where(~zoned), order, utc=False), tz, notes)
+        return with_zone.where(zoned, without_zone), notes
+    has_offset = zoned_share == 1
     parsed = _parse_text(text, order, utc=has_offset)
     if order == 'monthfirst':
         notes.append('Dates read as month/day/year.')
@@ -269,21 +279,47 @@ def read_file(file_obj, name):
             frame = pd.read_csv(StringIO(text))
         if frame.shape[1] < 2:
             raise ValueError('the file needs a time column and at least one temperature column, separated by commas, semicolons or tabs.')
+        _check_size(frame, 'the file')
         return {'CSV': merge_date_time_columns(frame)}
     if ext in {'.xlsx', '.xlsm', '.xls'}:
-        return {sheet: merge_date_time_columns(frame) for sheet, frame in pd.read_excel(BytesIO(raw), sheet_name=None).items()}
+        sheets = pd.read_excel(BytesIO(raw), sheet_name=None)
+        for sheet, frame in sheets.items():
+            _check_size(frame, f'worksheet "{sheet}"')
+        return {sheet: merge_date_time_columns(frame) for sheet, frame in sheets.items()}
     raise ValueError('Supported formats are XLSX, XLSM, XLS and CSV.')
+
+
+MAX_ROWS = 500_000  # a day of logging every second is 86,400 rows; this keeps one upload from exhausting the server
+
+
+def _check_size(frame, what):
+    if len(frame) > MAX_ROWS:
+        raise ValueError(f'{what} has {len(frame):,} rows, more than the {MAX_ROWS:,} the app accepts. '
+                         'Log less often, or cut the file down to the cook and hold.')
 
 
 TIME_NAMES = ('timestamp', 'datetime', 'date time', 'date/time', 'date_time', 'zeitstempel', 'datum/zeit', 'datum zeit')
 
 
-def detect_columns(df):
-    """The timestamp column and the likely meat-probe columns."""
+def _share_parsed(series):
+    """Share of the first 300 filled cells that read as a date-time (blank leading rows are skipped)."""
+    values = series.dropna().head(300)
+    return float(parse_ts(values).notna().mean()) if len(values) else 0.0
+
+
+def detect_columns(df, require_probes=True):
+    """The timestamp column and the likely meat-probe columns.
+
+    require_probes=False is for files that may hold only cooker or hold-oven
+    readings (hot, so they do not look like a meat probe): the probe list may
+    then be empty. The role of each column is decided separately, in Step 2.
+    """
     columns = list(df.columns); lowered = {c: str(c).lower() for c in columns}
+    if not columns or df.dropna(how='all').empty:
+        raise ValueError('this worksheet is empty. Choose another worksheet or file.')
     timestamp = next((c for c in columns if any(x in lowered[c] for x in TIME_NAMES)), None)
     if timestamp is None:
-        scores = [(parse_ts(df[c].head(300)).notna().mean(), index, c) for index, c in enumerate(columns)]
+        scores = [(_share_parsed(df[c]), index, c) for index, c in enumerate(columns)]
         score, _, timestamp = max(scores, key=lambda x: (x[0], -x[1]))
         if score < .25: raise ValueError('no time column was found. The file needs a column of dates and times (or separate date and time columns).')
     probes = [c for c in columns if c != timestamp and any(x in lowered[c] for x in ('probe', 'meat', 'internal', 'flat', 'point', 'food', 'brisket', 'kern', 'fleisch')) and not any(x in lowered[c] for x in ('pit', 'ambient', 'grate', 'controller', 'target', 'setpoint', 'set point'))]
@@ -291,9 +327,11 @@ def detect_columns(df):
         scored = []
         for c in columns:
             if c == timestamp: continue
-            values = parse_temp(df[c].head(300)); scored.append((float(values.between(-20, 150).mean()), c))
+            filled = df[c].dropna().head(300)
+            if filled.empty: continue
+            values = parse_temp(filled); scored.append((float(values.between(-20, 150).mean()), c))
         probes = [c for score, c in sorted(scored, key=lambda x: -x[0]) if score >= .25]
-    if not probes: raise ValueError('no temperature column was found.')
+    if not probes and require_probes: raise ValueError('no temperature column was found.')
     return timestamp, probes
 
 
@@ -328,7 +366,6 @@ def classify_session(valid):
     if rise>=20 and fall<8: return Detection('Cook Only',90,None,peak,float(smooth.mean()),float(smooth.min()),'The profile rises substantially and ends without a sustained cooling phase.')
     return Detection('Uncertain',55,pull if fall>=8 else None,peak,float(smooth.mean()),float(smooth.min()),'The profile is ambiguous; review the classification.')
 
-def band(temp): return -1 if temp<60 else min(int(np.searchsorted(BAND_LOWER_C,temp,side='right')-1),9)
 def assess(value):
     p=value*100
     return 'Underdone and tight' if p<80 else 'Slightly tight but sliceable' if p<95 else 'Ideal tenderness' if p<=105 else 'Very soft and potentially overdone' if p<=120 else 'Increased risk of mushy or over-rendered texture'

@@ -11,6 +11,8 @@ from reportlab.platypus import SimpleDocTemplate, Paragraph, Spacer, Table, Tabl
 from reportlab.graphics.shapes import Drawing, Line, String, Group, PolyLine, Circle
 from reportlab.pdfbase.pdfmetrics import stringWidth
 
+from labels import environment_stream_names
+
 DARK=colors.HexColor('#27343B'); ACCENT=colors.HexColor('#A94722'); LIGHT=colors.HexColor('#F3F5F6'); GRID=colors.HexColor('#D6DCE0'); TRANSFER=colors.HexColor('#7A3E9D')
 PALETTE=[colors.HexColor(x) for x in ('#C6532B','#2F6B9A','#5B7F4B','#8A5A9B','#C18B2F')]; CONTENT=A4[0]-28*mm
 STYLES=getSampleStyleSheet();STYLES.add(ParagraphStyle(name='ReportTitle',parent=STYLES['Title'],fontSize=21,leading=25,textColor=DARK));STYLES.add(ParagraphStyle(name='Section',parent=STYLES['Heading2'],fontSize=14,leading=17,textColor=ACCENT,spaceBefore=8,spaceAfter=6));STYLES.add(ParagraphStyle(name='Small',parent=STYLES['BodyText'],fontSize=7.4,leading=9));STYLES.add(ParagraphStyle(name='Cell',parent=STYLES['BodyText'],fontSize=7.1,leading=8.6));STYLES.add(ParagraphStyle(name='HeadCell',parent=STYLES['Cell'],fontName='Helvetica-Bold',textColor=colors.white));STYLES.add(ParagraphStyle(name='CellC',parent=STYLES['Cell'],alignment=1));STYLES.add(ParagraphStyle(name='HeadCellC',parent=STYLES['HeadCell'],alignment=1));STYLES.add(ParagraphStyle(name='Callout',parent=STYLES['BodyText'],fontSize=8.6,leading=11,textColor=colors.HexColor('#5A3A00')))
@@ -50,6 +52,13 @@ def _env(v,stage=None):
     if 'grate' in t:return 'Cook Environment - Grate'
     if 'pid' in t or 'controller' in t:return 'Cook Environment - PID'
     return _short(v)
+
+STREAM_DASHES=[None,[4,2],[1.5,2],[6,2,1.5,2]]
+
+def _split_source(source):
+    """'Secondary / Hold top' -> ('Secondary', 'Hold top'); a source without a file keeps only the column."""
+    file_label,sep,column=_text(source if source is not None else '').partition(' / ')
+    return (file_label.strip(),column.strip()) if sep else ('',file_label.strip())
 
 def _stage(label,r):
     role=_short(label);k=r.detection.session_type
@@ -101,7 +110,9 @@ def _segments(hours,values,max_gap_h):
 def _chart(series,title,origin=None,transfer=None,unit='°C',band=None,height=88*mm):
     """Line chart on the master timeline.
 
-    series: (name, frame, time column, value column). Lines only (no point
+    series: (name, frame, time column, value column[, options]). options may hold
+    'colour' (a colour) and 'dash' (a ReportLab dash array) to fix a stream's look
+    when its name does not decide it. Lines only (no point
     markers), broken at recording gaps, one fixed colour per entity, legend
     above the plot, light gridlines, round axis steps. band=(low, high, label)
     shades a horizontal range, e.g. the ideal rendering range.
@@ -111,7 +122,8 @@ def _chart(series,title,origin=None,transfer=None,unit='°C',band=None,height=88
     top=height-21*mm            # room above the plot for title, legend and transfer label
     plot_w=CONTENT-left-right;plot_h=top-bottom
     lines=[];xs=[];ys=[]
-    for index,(name,f,tc,vc) in enumerate(series):
+    for index,entry in enumerate(series):
+        name,f,tc,vc=entry[:4];options=entry[4] if len(entry)>4 else {}
         q=f[[tc,vc]].dropna().sort_values(tc)
         if q.empty:continue
         base=pd.Timestamp(origin) if origin is not None else q[tc].min()
@@ -122,7 +134,7 @@ def _chart(series,title,origin=None,transfer=None,unit='°C',band=None,height=88
             keep=max(len(q)//600,1);segments=[seg[::keep]+[seg[-1]] for seg in _segments(hours,values,max_gap)]
         else:
             segments=_segments(hours,values,max_gap)
-        lines.append((_short(name),_colour(name,index),segments))
+        lines.append((_text(name) if options else _short(name),options.get('colour') or _colour(name,index),segments,options.get('dash')))
         xs.extend(hours);ys.extend(v for v in values if pd.notna(v))
     if not lines:return Paragraph('No chart data available.',STYLES['BodyText'])
 
@@ -139,10 +151,10 @@ def _chart(series,title,origin=None,transfer=None,unit='°C',band=None,height=88
     # Title and legend (one row of swatches; wraps if it runs out of width)
     d.add(String(left,height-6*mm,title,fontName='Helvetica-Bold',fontSize=10,fillColor=INK))
     lx,ly=left,height-12*mm
-    for name,colour,_ in lines:
+    for name,colour,_,dash in lines:
         width=14+stringWidth(name,'Helvetica',7)+12
         if lx+width>left+plot_w:lx=left;ly-=9
-        d.add(Line(lx,ly+2.5,lx+10,ly+2.5,strokeColor=colour,strokeWidth=2))
+        d.add(Line(lx,ly+2.5,lx+10,ly+2.5,strokeColor=colour,strokeWidth=2,strokeDashArray=dash))
         d.add(String(lx+14,ly,name,fontName='Helvetica',fontSize=7,fillColor=MUTED))
         lx+=width
 
@@ -176,11 +188,11 @@ def _chart(series,title,origin=None,transfer=None,unit='°C',band=None,height=88
             d.add(String(mx+2,bottom+plot_h+4,'Smoker to hold',fontName='Helvetica',fontSize=6.5,fillColor=MUTED))
 
     # Data lines last, so they sit on top of the grid
-    for name,colour,segments in lines:
+    for name,colour,segments,dash in lines:
         for seg in segments:
             pts=[(px(x),py(y)) for x,y in seg if pd.notna(y)]
             if len(pts)>=2:
-                d.add(PolyLine([c for p in pts for c in p],strokeColor=colour,strokeWidth=1.5,strokeLineJoin=1,strokeLineCap=1))
+                d.add(PolyLine([c for p in pts for c in p],strokeColor=colour,strokeWidth=1.5,strokeLineJoin=1,strokeLineCap=1,strokeDashArray=dash))
             elif pts:
                 d.add(Circle(pts[0][0],pts[0][1],1.2,fillColor=colour,strokeColor=None))
     return d
@@ -205,8 +217,8 @@ def _when(v):
 def _hours(seconds):
     if seconds is None:
         return 'N/A'
-    h, m = divmod(int(seconds / 60 + 0.5), 60)  # round half up, matching the 2-decimal hours elsewhere
-    return f'{h} h {m:02d} min'
+    h, m = divmod(int(abs(seconds) / 60 + 0.5), 60)  # round half up, matching the 2-decimal hours elsewhere
+    return f"{'-' if seconds < 0 and (h or m) else ''}{h} h {m:02d} min"
 
 
 def _pct(v):
@@ -271,11 +283,19 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
     if overall_assessment and overall_assessment.get('spread_note'):
         s += [_callout(overall_assessment['spread_note']), Spacer(1, 3*mm)]
 
-    cook_seconds = (pd.Timestamp(transfer_time) - pd.Timestamp(master_start)).total_seconds() if transfer_time is not None and master_start is not None else None
-    hold_seconds = (pd.Timestamp(session_end) - pd.Timestamp(transfer_time)).total_seconds() if transfer_time is not None and session_end is not None else None
+    cook_seconds = hold_seconds = None
+    transfer_outside = False
+    if transfer_time is not None and master_start is not None and session_end is not None:
+        # A transfer set before the start or after the last reading cannot give negative times:
+        # the whole session then counts as one phase, as in the app.
+        start_ts, end_ts, transfer_ts = pd.Timestamp(master_start), pd.Timestamp(session_end), pd.Timestamp(transfer_time)
+        transfer_outside = transfer_ts < start_ts or transfer_ts > end_ts
+        inside = min(max(transfer_ts, start_ts), end_ts)
+        cook_seconds = (inside - start_ts).total_seconds()
+        hold_seconds = (end_ts - inside).total_seconds()
     total_seconds = (pd.Timestamp(session_end) - pd.Timestamp(master_start)).total_seconds() if session_end is not None and master_start is not None else None
     s += [_table([['Session start', _when(master_start), 'Cook time', _hours(cook_seconds)],
-                  ['Transfer to hold', _when(transfer_time) + (' (set by hand)' if transfer_set_by_user and transfer_time is not None else ''), 'Hold time', _hours(hold_seconds)],
+                  ['Transfer to hold', _when(transfer_time) + (' (set by hand)' if transfer_set_by_user and transfer_time is not None else '') + (' - outside the readings' if transfer_outside else ''), 'Hold time', _hours(hold_seconds)],
                   ['Last brisket reading', _when(session_end), 'Total', _hours(total_seconds)]],
                  [38*mm, 53*mm, 38*mm, 53*mm], header=False),
           Spacer(1, 2*mm)]
@@ -327,13 +347,16 @@ def build_pdf_report(app_version, configuration, meat_results, stats, environmen
     if environment_results:
         er = [['Stream', 'Source', 'Stage', 'Start', 'End', 'h', 'Avg °C', 'Min °C', 'Max °C', 'Stability', 'Level changes']]
         es = []
+        names = environment_stream_names({label: (_env(r.role), *_split_source(environment_sources.get(label))) for label, r in environment_results.items()})
+        seen = {}
         for label, r in environment_results.items():
-            f = r.timeline; n = _env(r.role); stage = 'Hold' if n == 'Hold Environment' else 'Cook'
+            f = r.timeline; base = _env(r.role); n = names[label]; stage = 'Hold' if base == 'Hold Environment' else 'Cook'
+            order = seen[base] = seen.get(base, -1) + 1   # later streams of one role are drawn dashed
             er.append([n, _source(environment_sources.get(label, 'N/A')), stage,
                        f.timestamp.min().strftime('%d/%m %H:%M'), f.timestamp.max().strftime('%d/%m %H:%M'),
                        f'{_duration(f):.2f}', _temp(r.average), _temp(r.minimum), _temp(r.maximum),
                        f'{r.stability_score:.0f}/100', str(getattr(r, 'level_changes', 0))])
-            es.append((n, f, 'timestamp', 'temperature_c'))
+            es.append((n, f, 'timestamp', 'temperature_c', {'colour': _colour(base, 0), 'dash': STREAM_DASHES[order % len(STREAM_DASHES)]}))
         s += [_table(er, [27*mm, 26*mm, 11*mm, 19*mm, 19*mm, 10*mm, 12*mm, 12*mm, 12*mm, 16*mm, 18*mm], 6.4),
               small('Stability (0-100) is scored while the cooker holds a temperature: deliberate setpoint steps and the '
                     'ramps between them are not counted against it. Level changes is the number of setpoint steps found.'),

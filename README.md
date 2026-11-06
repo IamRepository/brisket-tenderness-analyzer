@@ -56,19 +56,25 @@ A **Dark mode** switch sits beside the title.
 | `brisket_engine.py` | Reading files, session detection, combining probes, rendering calculation |
 | `pit_engine.py` | Column role suggestions and environment statistics (stability, level changes) |
 | `pdf_report.py` | The PDF report |
-| `test_analyzer.py` | Tests for the engines |
+| `labels.py` | Text helpers: safe display of file-derived names, unique and readable stream names |
+| `test_analyzer.py` | Tests for the engines and helpers |
+| `test_app.py` | Tests that run the whole app with faked uploads |
 | `requirements.txt` | Exact library versions the app is tested with |
 | `brisket-analyzer-notes.md` | Developer notes: conventions, design decisions, open issues |
 
 ## Running locally
 
+Needs Python 3.12 or newer.
+
 ```bash
 pip install -r requirements.txt
 streamlit run app.py
-python -m unittest test_analyzer
+python -m unittest test_analyzer test_app
 ```
 
 ## Deploying on Streamlit Community Cloud
+
+Choose Python 3.12 or newer under Advanced settings. `.streamlit/config.toml` limits uploads to 20 MB, and a file may hold at most 500,000 rows.
 
 After uploading a release that changes more than `app.py`, reboot the app (**Manage app → ⋮ → Reboot app**). Otherwise Streamlit can keep the previous version of the helper modules in memory.
 

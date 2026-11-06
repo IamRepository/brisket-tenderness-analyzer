@@ -1,12 +1,12 @@
 # Brisket Tenderness Analyzer: code notes
 
-Last updated 18 October 2026 for v2.8.6. Repo: github.com/IamRepository/brisket-tenderness-analyzer (public). Streamlit app on Streamlit Community Cloud, deployed from main.
+Last updated 6 November 2026 for v2.8.7. Repo: github.com/IamRepository/brisket-tenderness-analyzer (public). Streamlit app on Streamlit Community Cloud, deployed from main.
 
 ## Name and release conventions
 - Product name: Brisket Tenderness Analyzer (US spelling). It replaced "Brisket Session Analyser" in v2.8.1.
 - Logo: APP_ICON = ':material/timer:' (Google Material Symbols, chosen 18 Oct 2026 from seven options; same style as BBQ Chart to Data's ':material/dashboard:'), used as page_icon and before the title. Takes the text colour, so it follows dark mode.
 - Where the name appears: app.py (APP_NAME, used for page_title and st.title), pdf_report.py (report title, page footer), README.md title, release notes titles.
-- Workflow (from 16 Oct 2026): Claude has write access and commits and pushes releases straight to main (the user's choice; no pull requests). A push to main goes live on Streamlit Cloud. Before pushing: run the tests and an end-to-end app run. Commit message starts with the version, e.g. "v2.8.4: ...".
+- Workflow (from 16 Oct 2026): Claude has write access and commits and pushes releases straight to main (the user's choice; no pull requests). A push to main goes live on Streamlit Cloud. Before pushing: run `python -m unittest test_analyzer test_app` (test_app runs the whole app in Streamlit's AppTest) and look at the app in a browser (Playwright). Commit message starts with the version, e.g. "v2.8.4: ...".
 - Each release updates APP_VERSION, adds RELEASE_NOTES_vX.Y.Z.md (removing the previous one) and updates this file.
 - After a release that changes more than app.py, the user reboots the app (Manage app, ⋮, Reboot app). Otherwise Streamlit can keep the previous brisket_engine.py in memory; v2.8.0 failed with AttributeError on combine_probes until a reboot.
 - Before 16 Oct, releases were zips ("Brisket Tenderness Analyzer vX.Y.Z.zip") uploaded by hand; subfolders did not survive that upload, so files are kept at the top level.
@@ -16,8 +16,9 @@ Last updated 18 October 2026 for v2.8.6. Repo: github.com/IamRepository/brisket-
 - brisket_engine.py: parsing (parse_timestamps/parse_ts, parse_temp, read_file with merge_date_time_columns, detect_columns, prepare), classify_session (Cook + Hold / Hold Only / Calibration / Cook Only / Uncertain, pull = smoothed peak), analyse (10 temperature bands from 60 C, ZONE_RATES per hour, cook/hold split at pull, gaps above max_gap excluded; Result.timeline holds per-interval and accumulated rendering), assess (thresholds 80/95/105/120 %), combine_probes.
 - pit_engine.py: role constants (Point, Flat, Cook PID, Cook Grate, Hold Env, Ignore), classify_columns by name hints then shape, prepare, analyse (avg/min/max, steady_stability score and level_changes, lid-drop events for grate).
 - pdf_report.py: ReportLab A4 portrait report. Order: summary (results, spread callout, session times, main chart), session details (timing, temperatures, rendering by profile, accumulated rendering chart), environment (composite only with several hold sensors), one section per location (metrics + band table), method + assessment scale, configuration. Table text is Paragraphs, so colour/alignment/bold must come from paragraph styles (HeadCell, CellC) or <b> markup, not TableStyle. _chart() draws its own lines, grid, legend and labels (no LinePlot).
-- test_analyzer.py: 35 tests (date formats, time zones, clock change, date+time columns, encodings, roles, combine_probes, session and short rests, rendering calculation and transfer split, speed, assessment scale, stability, PDF text escaping). Run: python -m unittest test_analyzer.
-- requirements.txt: exact versions tested. .gitignore: keeps __pycache__ out.
+- labels.py: text helpers shared by app and PDF: md_safe (file text in Streamlit labels/messages: Markdown escaped, zero-width space after ':' and '@' and inside 'www.' so nothing auto-links), plotly_text (series names), unique_label, environment_stream_names (role alone, or role + column, or role + file / column).
+- test_analyzer.py: 53 tests (date formats, time zones incl. mixed zoned/unzoned, clock change, date+time columns, encodings, detect_columns, row limit, roles, labels, combine_probes, session and short rests, rendering calculation and transfer split, speed, assessment scale, stability, PDF text and times). test_app.py: 5 tests that run app.py with faked uploads (secondary file failing halfway, same-name hold sensors, two hold columns, hot smoker-only secondary, Markdown header). Run: python -m unittest test_analyzer test_app.
+- requirements.txt: exact versions tested (Streamlit 1.66.1, Pillow 13.0.0 pinned so a Pillow fix is not blocked by Streamlit's own limit); Python 3.12+. .streamlit/config.toml: maxUploadSize = 20 (MB). .gitignore: keeps __pycache__ out.
 
 ## Model
 Rendering = sum over intervals of hours x band rate, using the temperature at the start of each interval (analyse() is vectorised with numpy; identical to the old per-row loop). Whole-brisket = mean of canonical Point and Flat totals. Transfer = the user's manual setting (transfer_mode / transfer_date / transfer_clock in session_state, read by manual_transfer_time()) or else the median of Cook + Hold pull times (derive_transfer_time). When a transfer is known, analyse() and phase_stats() split every probe at it whatever its session type; complete = readings on both sides and (Cook + Hold or a session transfer).
@@ -29,7 +30,8 @@ Spread note when Point and Flat assessments differ or totals differ by >= 25 poi
 - Every timestamp is time-zone-aware in one zone: the viewer's browser zone (VIEW_TZ in app.py, from st.context.timezone; UTC if unknown). Never mix naive and aware values.
 - parse_timestamps(series, tz) -> (aware series, notes). Per column: Excel serials; native datetimes (aware -> converted, naive -> localised); time-only columns roll over at midnight; strings: zone words (CEST/CET/MESZ/MEZ/BST/UTC/GMT, Z) -> offsets; date order decided once per column (_date_order: ISO, first field > 12 = day-first, second > 12 = month-first, else the reading with the smaller total step wins, tie = day-first); then one format for the whole column (guess_datetime_format, fallback format='mixed').
 - _localise: naive local times are localised with ambiguous flags from file order (first pass of the repeated autumn hour = summer time, second = winter time); spring gaps shift forward.
-- read_file decodes UTF-8 / cp1252 / Latin-1 and merges a date-only + time-only column pair into COMBINED_TIME_COLUMN.
+- A column with some zoned and some unzoned values (0 < share < 1) is read per value: zoned -> UTC -> viewer zone, unzoned -> localised; a note says so.
+- read_file decodes UTF-8 / cp1252 / Latin-1 and merges a date-only + time-only column pair into COMBINED_TIME_COLUMN. Files over MAX_ROWS (500,000) are refused. detect_columns(df, require_probes=False) is used for both files (roles are chosen in Step 2); it says so when a worksheet is empty.
 - pdf_report: table cells go through _cell(), which XML-escapes file text; use the Markup class for intentional <b> markup.
 
 ## Charts
@@ -39,6 +41,8 @@ Spread note when Point and Flat assessments differ or totals differ by >= 25 poi
 
 ## UI state
 - Dark mode: theme_switch() beside the title (copied from BBQ Chart to Data): a toggle that clicks Streamlit's ⋮ menu Light/Dark item, then Rerun. IS_DARK from st.context.theme.type picks the colour set (SERIES_COLOURS, PHASE_COLOURS, MARKER_COLOUR, IDEAL_FILL/TEXT, FILE_BOX). Dark series: Point #3987e5, Flat #d95926, PID #199e70, Grate #c98500, Hold #d55181; phases #e66767 / #9085e9 (validated --mode dark per chart). PDF stays light.
+- The secondary file is read into local names and only kept if everything succeeded (no half-added columns). Environment streams use unique_label keys; chart names come from environment_stream_names, colour from the role (series_colour(plain_role(role))), later streams of one role dashed (STREAM_DASHES). File text going into labels or messages passes md_safe; into Plotly names plotly_text.
+- The PDF is cached in session_state (pdf_bytes, pdf_key = version, files, sheets, roles, gap, transfer, zone); it is rebuilt only when that key changes. Analysis still runs on every rerun (about 4.5 s at 480k rows, the limit being 500k).
 - Transfer setting resets with new files, like the gap override (override_files key).
 - st.session_state.analysed keeps results visible after "Analyse session"; it resets when the uploaded files change (file_id pair in analysed_files).
 - Sampling settings use widget keys override_gap and manual_gap_seconds. They are read from session_state at the top of the run, because the widgets are drawn after the summary table.
@@ -55,6 +59,8 @@ Spread note when Point and Flat assessments differ or totals differ by >= 25 poi
 - v2.8.4: audit fixes 1-6, 8, 12, 13, 15: ISO dates, time zones and offsets, end-of-summer-time clock change, separate date/time columns, per-column date order, Windows-encoded CSVs, role suggestions (setpoint/fan/battery ignored, Pit), gap override default, clearer errors, secondary file can't block the run, PDF text escaping, upload cache capped; 29 tests.
 - v2.8.5: dark mode toggle; vectorised rendering (24 h at 2 s: 80 s -> 2.5 s); short rests detected by time after the peak; more accurate pull; manual smoker-to-hold transfer with a hint when the cook environment stops early; the transfer splits every probe; 35 tests.
 - v2.8.6: timer logo (Material Symbols) in the title and browser tab, replacing the 🔥 emoji.
+- 5 Nov 2026: Morning GitHub audit of v2.8.6; findings in the project doc claude/brisket-analyzer-backlog.md.
+- v2.8.7 (6 Nov 2026): all 12 backlog items: secondary-file crash, env stream key collision and chart names (app and PDF), mixed time zones, env-only secondary files, upload limits (20 MB, 500k rows, cached PDF), Markdown/Plotly-safe file text, PDF negative hours, empty-sheet message, Python 3.12 note, dead code, Streamlit 1.66.1 + Pillow 13.0.0 (pip-audit clean); 58 tests.
 
 ## Open issues
 1. Fahrenheit files are read as Celsius (readings above 150 dropped); no unit detection.
@@ -63,4 +69,5 @@ Spread note when Point and Flat assessments differ or totals differ by >= 25 poi
 4. Very short rests (under 30 min, or a fall under 8 C) still read as Cook Only; the manual transfer covers them.
 5. Band rates give high totals for long holds near 90 C (test cooks score 140-200 %). Needs checking against real cooks with known outcomes; the user is to supply cook files.
 6. Lid-open events are detected for grate streams but never shown.
-7. .devcontainer/devcontainer.json is only for GitHub Codespaces; harmless.
+7. .devcontainer/devcontainer.json is only for GitHub Codespaces (now Python 3.12); harmless.
+8. The analysis is recomputed on every rerun (the PDF is not); caching it would need a key over the uploaded data. Only matters near the 500k-row limit.

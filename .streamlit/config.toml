@@ -1,0 +1,3 @@
+[server]
+# The public app accepts files up to 20 MB (a day of logging every second is well under 10 MB).
+maxUploadSize = 20

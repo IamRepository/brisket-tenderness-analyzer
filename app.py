@@ -13,10 +13,11 @@ import streamlit as st
 
 import brisket_engine as engine
 import pit_engine as pit
+from labels import environment_stream_names, md_safe, plotly_text, unique_label
 from pdf_report import build_pdf_report
 
 APP_NAME = "Brisket Tenderness Analyzer"
-APP_VERSION = "2.8.6"
+APP_VERSION = "2.8.7"
 APP_ICON = ":material/timer:"  # Google Material Symbols "timer": time at temperature; same style as BBQ Chart to Data
 POINT = pit.POINT
 FLAT = pit.FLAT
@@ -46,6 +47,7 @@ FILE_BOX = ({"Primary": ("#16263d", "#2c4a72", "#e6edf7"), "Secondary": ("#15301
 MAX_PLAUSIBLE_SESSION_H = 72  # longer spans usually mean the dates were misread
 SPREAD_WARNING = 0.25  # Point/Flat totals this far apart (25 points) get a note even within one assessment band
 ENVIRONMENT_ROLES = {COOK_PID, COOK_GRATE, HOLD_ENV}
+STREAM_DASHES = ["solid", "dash", "dot", "dashdot"]  # for several streams of one environment role
 
 st.set_page_config(page_title=f"{APP_NAME} {APP_VERSION}", page_icon=APP_ICON, layout="wide")
 
@@ -219,11 +221,6 @@ def sampling_info(valid, override=None):
     normal = float(gaps.median()) if not gaps.empty else None
     automatic = max(normal * 3.0, normal + 1.0) if normal is not None else 10.0
     return {"normal": normal, "threshold": float(override) if override is not None else automatic, "mode": "Manual override" if override is not None else "Automatic"}
-
-
-def unique_label(role, file_label, column, existing):
-    base = f"{role} — {column}"
-    return base if base not in existing else f"{role} — {file_label} / {column}"
 
 
 def phase_stats(valid, detection, transfer_time=None):
@@ -454,7 +451,7 @@ def build_composite_environment(environment_results):
             frame = result.timeline[["timestamp", "temperature_c"]].copy()
             frame.rename(columns={"temperature_c": f"sensor_{index}"}, inplace=True)
             renamed.append(frame.set_index("timestamp"))
-        joined = pd.concat(renamed, axis=1).sort_index()
+        joined = pd.concat(renamed, axis=1, sort=True)
         hold_frame = joined.mean(axis=1, skipna=True).rename("Environment aggregate °C").to_frame()
         hold_frame["Available sensors"] = joined.notna().sum(axis=1)
         hold_frame["Phase"] = "Hold"
@@ -463,7 +460,7 @@ def build_composite_environment(environment_results):
     return cook, hold_frame
 
 
-def consolidate_meat_profiles(raw_results, manual_gap=None):
+def consolidate_meat_profiles(raw_results):
     """Create one continuous profile per physical brisket location.
 
     Point streams are combined only with Point streams, and Flat streams only
@@ -659,31 +656,37 @@ try:
     sheets = load_file(primary.getvalue(), primary.name)
     primary_sheet = upload_left.selectbox("Primary worksheet", list(sheets), key="primary_sheet")
     primary_df = sheets[primary_sheet]
-    primary_time, _ = engine.detect_columns(primary_df)
+    primary_time, _ = engine.detect_columns(primary_df, require_probes=False)
     classifications = pit.classify_columns(primary_df, primary_time)
     classifications["File"] = "Primary"
     for note in time_notes("Primary", primary_df, primary_time):
         upload_left.caption(f"🕒 {note}")
 except Exception as exc:
-    st.error(f"The primary file could not be read: {exc}")
+    st.error(f"The primary file could not be read: {md_safe(exc)}")
     st.stop()
 
 secondary_name = secondary_df = secondary_time = None
 if secondary is not None:
+    # Everything about the secondary file is worked out in local names first and kept only if all of it
+    # succeeded, so a file that fails halfway never leaves its columns in Step 2.
     try:
         sheets2 = load_file(secondary.getvalue(), secondary.name)
         secondary_sheet = upload_right.selectbox("Secondary worksheet", list(sheets2), key="secondary_sheet")
-        secondary_df = sheets2[secondary_sheet]
-        secondary_time, _ = engine.detect_columns(secondary_df)
-        classifications2 = pit.classify_columns(secondary_df, secondary_time)
-        classifications2["File"] = "Secondary"
-        classifications = pd.concat([classifications, classifications2], ignore_index=True)
-        secondary_name = secondary.name
-        for note in time_notes("Secondary", secondary_df, secondary_time):
-            upload_right.caption(f"🕒 {note}")
+        frame2 = sheets2[secondary_sheet]
+        time2, _ = engine.detect_columns(frame2, require_probes=False)
+        found2 = pit.classify_columns(frame2, time2)
+        if found2.empty:
+            raise ValueError("no temperature column was found.")
+        found2["File"] = "Secondary"
+        notes2 = time_notes("Secondary", frame2, time2)
     except Exception as exc:
-        upload_right.error(f"The secondary file could not be read and is left out: {exc}")
-        secondary_df = secondary_time = None
+        PARSED_TIMES.pop("Secondary", None)
+        upload_right.error(f"The secondary file could not be read and is left out: {md_safe(exc)}")
+    else:
+        secondary_df, secondary_time, secondary_name = frame2, time2, secondary.name
+        classifications = pd.concat([classifications, found2], ignore_index=True)
+        for note in notes2:
+            upload_right.caption(f"🕒 {note}")
 
 if classifications.empty:
     st.error("No temperature columns were found in the uploaded file(s).")
@@ -707,7 +710,7 @@ for file_label, icon in (("Primary", "🟦"), ("Secondary", "🟩")):
             key = f"{file_label}_{raw_column}"
             suggestion = row["Suggested role"]
             index = pit.ROLES.index(suggestion) if suggestion in pit.ROLES else pit.ROLES.index(IGNORE)
-            roles[key] = st.selectbox(f"{shown_column} ({row['Confidence']}% suggested confidence)", pit.ROLES, index=index, key=f"role_{key}")
+            roles[key] = st.selectbox(f"{md_safe(shown_column)} ({row['Confidence']}% suggested confidence)", pit.ROLES, index=index, key=f"role_{key}")
 
 config = []
 for _, row in classifications.iterrows():
@@ -744,7 +747,7 @@ for _, row in classifications.iterrows():
         elif role in ENVIRONMENT_ROLES:
             environment_inputs.append({"role": role, "file": file_label, "column": raw_column, "shown": shown_column, "df": active_df, "time": active_time, "times": PARSED_TIMES.get(file_label)})
     except Exception as exc:
-        errors.append(f"{file_label} / {shown_column}: {exc}")
+        errors.append(f"{file_label} / {md_safe(shown_column)}: {md_safe(exc)}")
 for error in errors:
     st.error(error)
 if not raw_meat_results:
@@ -754,24 +757,37 @@ if not raw_meat_results:
         st.error("At least one column must be classified as Brisket - Point or Brisket - Flat.")
     st.stop()
 
-meat_results = consolidate_meat_profiles(raw_meat_results, manual_gap)
+meat_results = consolidate_meat_profiles(raw_meat_results)
 automatic_transfer = derive_transfer_time(meat_results)
 manual_transfer = manual_transfer_time()
 transfer_time = manual_transfer if manual_transfer is not None else automatic_transfer
 meat_results = reanalyse_canonical_profiles(meat_results, transfer_time)
 overall_assessment = overall_brisket_assessment(meat_results)
+usable_inputs = []
 for item in environment_inputs:
-    item["prepared"] = pit.prepare(item["df"], item["time"], item["column"], VIEW_TZ, item["times"])
-environment_results, environment_sources = {}, {}
-for item in environment_inputs:
-    prepared = item["prepared"]
-    segmented = segment_environment(prepared, item["role"], transfer_time)
-    if segmented.empty:
-        st.warning(f"{item['file']} / {item['shown']}: no readings overlap the applicable phase.")
+    try:
+        item["prepared"] = pit.prepare(item["df"], item["time"], item["column"], VIEW_TZ, item["times"])
+    except Exception as exc:
+        st.error(f"{item['file']} / {md_safe(item['shown'])}: {md_safe(exc)}")
         continue
-    label = f"{item['role']} — {item['shown']}"
-    environment_results[label] = pit.analyse(segmented, item["role"])
+    usable_inputs.append(item)
+environment_inputs = usable_inputs
+environment_results, environment_sources, environment_columns = {}, {}, {}
+for item in environment_inputs:
+    where = f"{item['file']} / {md_safe(item['shown'])}"
+    try:
+        segmented = segment_environment(item["prepared"], item["role"], transfer_time)
+        if segmented.empty:
+            st.warning(f"{where}: no readings overlap the applicable phase.")
+            continue
+        # A unique key per stream: two sensors with the same role and column name stay two streams.
+        label = unique_label(item["role"], item["file"], item["shown"], environment_results)
+        environment_results[label] = pit.analyse(segmented, item["role"])
+    except Exception as exc:
+        st.error(f"{where}: {md_safe(exc)}")
+        continue
     environment_sources[label] = display_source(f"{item['file']} / {item['shown']}")
+    environment_columns[label] = (plain_role(item["role"]), item["file"], item["shown"])
 
 master_start = derive_master_start(meat_results, environment_results)
 st.header("Session detection summary")
@@ -856,19 +872,27 @@ st.plotly_chart(probe_figure, width="stretch", key="brisket_comparison")
 if environment_results:
     st.header("Environment analysis")
     env_rows, env_frames = [], []
+    stream_names = environment_stream_names(environment_columns)
+    stream_dash, seen_roles = {}, {}
     for label, result in environment_results.items():
         stage = "Hold" if result.role == HOLD_ENV else "Cook"
-        stream_name = plain_role(label)
+        stream_name = stream_names[label]
+        # Streams of one role share its colour; the second and later ones are dashed so they can be told apart.
+        order = seen_roles[result.role] = seen_roles.get(result.role, -1) + 1
+        stream_dash[plotly_text(stream_name)] = STREAM_DASHES[order % len(STREAM_DASHES)]
         env_rows.append({"Environment stream": stream_name, "Source": environment_sources[label], "Stage": stage, "Start": f"{result.timeline['timestamp'].min():%d/%m %H:%M}", "End": f"{result.timeline['timestamp'].max():%d/%m %H:%M}", "Hours": f"{duration_hours(result.timeline):.2f}", "Avg °C": f"{result.average:.1f}", "Min °C": f"{result.minimum:.1f}", "Max °C": f"{result.maximum:.1f}", "Stability": f"{result.stability_score:.0f}/100", "Level changes": result.level_changes})
         frame = break_gaps(elapsed_frame(result.timeline, master_start), sampling_info(result.timeline)["threshold"])
-        frame["Environment stream"] = stream_name
+        frame["Environment stream"] = plotly_text(stream_name)
+        frame["Colour key"] = plain_role(result.role)
         env_frames.append(frame)
     html_table(env_rows, numeric=("Hours", "Avg °C", "Min °C", "Max °C", "Level changes"))
     st.caption("Stability (0–100) is scored while the cooker holds a temperature; planned setpoint steps and the ramps between them are not counted against it.")
     env_combined = pd.concat(env_frames, ignore_index=True)
+    env_colours = env_combined.drop_duplicates("Environment stream").set_index("Environment stream")["Colour key"]
     env_figure = px.line(
-        env_combined, x="Elapsed session hours", y="temperature_c", color="Environment stream",
-        color_discrete_map={name: series_colour(name) for name in env_combined["Environment stream"].unique()},
+        env_combined, x="Elapsed session hours", y="temperature_c", color="Environment stream", line_dash="Environment stream",
+        color_discrete_map={name: series_colour(key) for name, key in env_colours.items()},
+        line_dash_map=stream_dash,
         title="Cook and Hold Environment profiles",
         labels={"Elapsed session hours": "Elapsed time from session start (hours)", "temperature_c": "Temperature (°C)", "Environment stream": ""},
     )
@@ -926,23 +950,30 @@ def report_time():
     return datetime.now(ZoneInfo(VIEW_TZ))
 
 
-cook_aggregate, hold_aggregate = build_composite_environment(environment_results)
-pdf_bytes = build_pdf_report(
-    app_version=APP_VERSION,
-    configuration=config,
-    meat_results=meat_results,
-    stats=stats,
-    environment_results=environment_results,
-    environment_sources=environment_sources,
-    transfer_time=transfer_time,
-    master_start=master_start,
-    cook_aggregate=cook_aggregate,
-    hold_aggregate=hold_aggregate,
-    environment_integrity=integrity,
-    overall_assessment=overall_assessment,
-    generated_at=report_time(),
-    transfer_set_by_user=manual_transfer is not None,
-)
+# The report only depends on the files, worksheets, roles, gap limit, transfer and zone, so changing the
+# theme or opening an expander reuses the last one instead of drawing every chart again.
+pdf_key = (APP_VERSION, files_key, VIEW_TZ, st.session_state.get("primary_sheet"), st.session_state.get("secondary_sheet"),
+           tuple(sorted(roles.items())), manual_gap, None if transfer_time is None else transfer_time.isoformat())
+if st.session_state.get("pdf_key") != pdf_key:
+    cook_aggregate, hold_aggregate = build_composite_environment(environment_results)
+    st.session_state.pdf_bytes = build_pdf_report(
+        app_version=APP_VERSION,
+        configuration=config,
+        meat_results=meat_results,
+        stats=stats,
+        environment_results=environment_results,
+        environment_sources=environment_sources,
+        transfer_time=transfer_time,
+        master_start=master_start,
+        cook_aggregate=cook_aggregate,
+        hold_aggregate=hold_aggregate,
+        environment_integrity=integrity,
+        overall_assessment=overall_assessment,
+        generated_at=report_time(),
+        transfer_set_by_user=manual_transfer is not None,
+    )
+    st.session_state.pdf_key = pdf_key
+pdf_bytes = st.session_state.pdf_bytes
 report_name = f"brisket_tenderness_report_{pd.Timestamp(master_start):%Y-%m-%d}.pdf" if master_start is not None else "brisket_tenderness_report.pdf"
 report_slot.download_button("📄 Download full PDF report", data=pdf_bytes, file_name=report_name, mime="application/pdf", type="primary", width="stretch", on_click="ignore")
 st.caption("All charts use one master session timeline. Cook Environment streams are evaluated before the transfer boundary, Hold Environment streams after it, and missing values are not interpolated across transfer.")
